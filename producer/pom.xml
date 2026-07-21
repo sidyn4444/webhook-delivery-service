@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>io.github.sidyn4444.webhooks</groupId>
+        <artifactId>webhook-delivery-service</artifactId>
+        <version>0.0.1-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>producer</artifactId>
+    <name>producer</name>
+    <description>Receives events over HTTP, validates them, and enqueues delivery jobs to Redis</description>
+
+    <dependencies>
+
+        <!--
+            WHY: this module creates Event / DeliveryJob objects and writes them
+            to Redis — those classes live in common. Without it: won't compile.
+            NO <version> — supplied by the root's <dependencyManagement>.
+        -->
+        <dependency>
+            <groupId>io.github.sidyn4444.webhooks</groupId>
+            <artifactId>common</artifactId>
+        </dependency>
+
+        <!--
+            WHY: the producer's entire job is RECEIVING HTTP (POST /events).
+            Brings Spring MVC (URL -> method), embedded Tomcat (the server),
+            and Jackson (JSON <-> Java). Without it: no way to receive an event.
+            NO <version> — managed by spring-boot-starter-parent.
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+
+        <!--
+            WHY: exposes /actuator/health (proven in 4i). In Week 4 this is the
+            target of the K8s liveness + readiness probes. Without it: K8s can't
+            tell if the pod is alive or ready -> no self-healing, no chaos demo.
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+
+        <!-- Also inherited from the root: spring-boot-starter-test (all modules) -->
+
+        <!--
+            Week 2 adds:
+              spring-boot-starter-data-redis  -> enqueue jobs (1d: the queue decouples)
+              spring-boot-starter-validation  -> @Valid input + SSRF checks (3b)
+        -->
+
+    </dependencies>
+
+    <!-- APP MODULE: repackage into an executable "fat JAR" (what Week 4's Dockerfile copies in) -->
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+
+</project>

@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+
+    <modelVersion>4.0.0</modelVersion>
+
+    <!-- ============================================================
+         INHERITANCE: we inherit from Spring Boot's parent POM.
+         It supplies tested-together versions for every Spring library
+         plus sane plugin defaults, so we never pick versions by hand.
+         ============================================================ -->
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.3.5</version>
+        <relativePath/> <!-- empty = look in the Maven repo, not a local folder -->
+    </parent>
+
+    <!-- ============================================================
+         IDENTITY — the 3 "GAV coordinates" that uniquely name this
+         project, the same way you'd name any library you depend on.
+           groupId    = who made it   (reverse domain, globally unique)
+           artifactId = what it is
+           version    = which build   (SNAPSHOT = draft, changes often)
+         Together they become the folder path in ~/.m2/repository/.
+         ============================================================ -->
+    <groupId>io.github.sidyn4444.webhooks</groupId>
+    <artifactId>webhook-delivery-service</artifactId>
+    <version>0.0.1-SNAPSHOT</version>
+
+    <!-- SEPARATE from identity: what does building this produce?
+         jar = a JAR file (the default, used by our 3 modules)
+         pom = nothing. This project only coordinates other projects. -->
+    <packaging>pom</packaging>
+
+    <name>webhook-delivery-service</name>
+    <description>Distributed webhook delivery service — Spring Boot producer/worker on Redis, deployed to AWS EKS</description>
+
+    <!-- ============================================================
+         AGGREGATION: the modules this root builds, in dependency
+         order. Maven works out the order itself — 'common' first,
+         because the other two depend on it.
+         ============================================================ -->
+    <modules>
+        <module>common</module>
+        <module>producer</module>
+        <module>worker</module>
+    </modules>
+
+    <!-- ============================================================
+         PROPERTIES: named values reused below and inherited by every
+         module. One place to change a version.
+         ============================================================ -->
+    <properties>
+        <java.version>21</java.version>
+        <maven.compiler.release>21</maven.compiler.release>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    </properties>
+
+    <!-- ============================================================
+         DEPENDENCY MANAGEMENT: declares the VERSION of our own
+         'common' module so the child poms can depend on it without
+         repeating a version. This section grants nothing on its own —
+         it only says "if you ask for this, here's which version."
+         ============================================================ -->
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>io.github.sidyn4444.webhooks</groupId>
+                <artifactId>common</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <!-- ============================================================
+         DEPENDENCIES: given to EVERY module, no asking. Kept
+         deliberately tiny — only what all three genuinely need.
+         ============================================================ -->
+    <dependencies>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope> <!-- test scope = compiled for tests, never shipped in the JAR -->
+        </dependency>
+    </dependencies>
+
+</project>

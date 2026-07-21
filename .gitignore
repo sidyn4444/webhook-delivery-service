@@ -1,0 +1,41 @@
+# ===== Secrets — NEVER commit =====
+.env
+.env.local
+application-local.properties
+*.key
+*.pem
+secrets/
+
+# ===== Maven build output =====
+target/
+!.mvn/wrapper/maven-wrapper.jar
+.mvn/timing.properties
+
+# ===== IDE =====
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/settings.json
+.settings/
+.classpath
+.project
+
+# ===== OS =====
+.DS_Store
+Thumbs.db
+
+# ===== Logs =====
+*.log
+logs/
+
+# ===== Claude Code local config =====
+.claude/
+
+# ===== Personal / private — kept out of the public repo =====
+# docs/ holds the project brief (GPA, salary target, target companies) and the
+# learning log — personal, never publish.
+# notes/ and checklists/ are personal learning material (author's choice to keep private).
+docs/
+notes/
+checklists/

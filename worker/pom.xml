@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>io.github.sidyn4444.webhooks</groupId>
+        <artifactId>webhook-delivery-service</artifactId>
+        <version>0.0.1-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>worker</artifactId>
+    <name>worker</name>
+    <description>Pulls delivery jobs from Redis and POSTs HMAC-signed webhooks to subscriber URLs</description>
+
+    <dependencies>
+
+        <!--
+            WHY: this module reads DeliveryJob objects OUT of Redis — the same
+            classes the producer wrote IN. This is the shared contract in action:
+            one definition, so the two sides cannot drift apart.
+            NO <version> — supplied by the root's <dependencyManagement>.
+        -->
+        <dependency>
+            <groupId>io.github.sidyn4444.webhooks</groupId>
+            <artifactId>common</artifactId>
+        </dependency>
+
+        <!--
+            WHY: plain spring-boot-starter, NOT -starter-web (deliberate).
+            Gives the machinery to BE a Spring app — dependency injection,
+            config loading, logging — with no web server.
+            The worker is a DAEMON: it pulls from a queue, nobody calls it.
+            Shipping -web would mean a bigger image, a wider attack surface,
+            an open port nobody should reach, and slower startup — for a door
+            nobody knocks on.
+            (5f sets spring.main.web-application-type=none to make it explicit.)
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter</artifactId>
+        </dependency>
+
+        <!-- Also inherited from the root: spring-boot-starter-test (all modules) -->
+
+        <!--
+            Week 2 adds:
+              spring-boot-starter-data-redis -> pull jobs from the queue (2c)
+              spring-boot-starter-webflux    -> WebClient for OUTBOUND POSTs (2a)
+                                                (the HTTP client, not a server)
+              spring-boot-starter-data-jpa
+              postgresql                     -> the delivery log (2b) — worker only,
+                                                the producer never touches Postgres
+        -->
+
+    </dependencies>
+
+    <!-- APP MODULE: repackage into an executable "fat JAR" -->
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+
+</project>

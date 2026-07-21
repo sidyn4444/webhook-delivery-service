@@ -1,0 +1,52 @@
+# docker-compose.yml — local dev environment ONLY.
+# Brings up Redis + Postgres for Weeks 2-3 development. In AWS (Week 5) these are
+# replaced by managed ElastiCache (Redis) + RDS (Postgres); this file does not ship.
+#
+# Versions pinned to match production (dev/prod parity — see notes 4a): Redis 7, Postgres 16.
+# Passwords come from .env (gitignored), never hardcoded here.
+#
+# Usage:  docker compose up -d      (start in background)
+#         docker compose ps         (see status/health)
+#         docker compose down       (stop + remove containers)
+#         docker compose down -v     (also delete the data volumes)
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: webhook-redis
+    # --requirepass turns ON Redis auth (the AUTH decision — see notes 4h).
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}"]
+    ports:
+      - "6379:6379"          # host:container — reachable at localhost:6379
+    volumes:
+      - redis-data:/data       # persist queue data across restarts
+    healthcheck:
+      # authenticated PING — proves auth works, not just that the port is open
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: webhook-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "5432:5432"          # host:container — reachable at localhost:5432
+    volumes:
+      - postgres-data:/var/lib/postgresql/data   # persist the delivery log across restarts
+    healthcheck:
+      # pg_isready checks the DB is actually accepting connections as our user
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+  postgres-data:

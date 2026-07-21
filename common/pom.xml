@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+
+    <modelVersion>4.0.0</modelVersion>
+
+    <!-- INHERITANCE: version must be a literal string, never ${...} -->
+    <parent>
+        <groupId>io.github.sidyn4444.webhooks</groupId>
+        <artifactId>webhook-delivery-service</artifactId>
+        <version>0.0.1-SNAPSHOT</version>
+    </parent>
+
+    <!-- groupId + version inherited from the parent; only the name is ours -->
+    <artifactId>common</artifactId>
+    <name>common</name>
+    <description>Shared models, Redis key constants and utilities used by producer and worker</description>
+
+    <!--
+        LIBRARY MODULE — deliberately minimal.
+        Everything declared here becomes TRANSITIVE: producer and worker
+        inherit it automatically. What goes in the shared box, everyone carries.
+        (spring-boot-starter-test arrives from the root's <dependencies>.)
+        Week 2 adds only what the shared code itself genuinely needs.
+    -->
+    <dependencies>
+    </dependencies>
+
+    <!--
+        NO <build> BLOCK — on purpose.
+        spring-boot-maven-plugin would repackage this into an executable JAR,
+        which nests the classes where a normal classpath lookup can't find them,
+        breaking producer's and worker's ability to depend on it.
+    -->
+
+</project>
