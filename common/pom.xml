@@ -55,6 +55,20 @@
             <artifactId>jackson-databind</artifactId>
         </dependency>
 
+        <!--
+            WHY: jackson-databind alone CANNOT serialize java.time.Instant. It throws
+            "Java 8 date/time type java.time.Instant not supported by default".
+            Support ships as a separate module, and DeliveryJob has an Instant field.
+
+            It belongs here rather than in each app because the module that DEFINES a
+            field is the module responsible for being able to serialize it. A shared
+            model that its own consumers cannot serialize is only half a contract.
+        -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.datatype</groupId>
+            <artifactId>jackson-datatype-jsr310</artifactId>
+        </dependency>
+
     </dependencies>
 
     <!--
