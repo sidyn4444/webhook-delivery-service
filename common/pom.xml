@@ -25,6 +25,36 @@
         Week 2 adds only what the shared code itself genuinely needs.
     -->
     <dependencies>
+
+        <!--
+            WHY: the shared model classes carry Bean Validation annotations
+            (@NotBlank, @Pattern) so the CONTRACT and its RULES live together in
+            one file. This artifact is annotations ONLY — the tiny interface
+            definitions, no engine. The producer supplies the engine
+            (spring-boot-starter-validation) that reads them and enforces them.
+            Splitting it this way keeps 'common' free of any web/server code
+            while still letting the rules travel with the model.
+            NO <version> — managed by spring-boot-starter-parent.
+        -->
+        <dependency>
+            <groupId>jakarta.validation</groupId>
+            <artifactId>jakarta.validation-api</artifactId>
+        </dependency>
+
+        <!--
+            WHY: these models cross the wire twice — HTTP JSON on the way in,
+            and a JSON string stored in Redis on the way through. The field-name
+            mapping (@JsonProperty) is declared ON the model, so producer and
+            worker cannot disagree about what the JSON looks like no matter how
+            either app configures its own ObjectMapper.
+            Both apps would pull Jackson in anyway; declaring it here makes the
+            dependency honest — the shared code itself needs it.
+        -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+        </dependency>
+
     </dependencies>
 
     <!--
