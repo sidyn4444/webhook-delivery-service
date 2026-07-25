@@ -48,13 +48,39 @@
             <artifactId>spring-boot-starter-actuator</artifactId>
         </dependency>
 
-        <!-- Also inherited from the root: spring-boot-starter-test (all modules) -->
+        <!--
+            WHY: the producer's second job is putting jobs on the queue. This brings
+            Lettuce (the Redis client) plus Spring's RedisTemplate/StringRedisTemplate
+            wrapper, and auto-configures a connection from the spring.data.redis.*
+            properties. Without it there is nowhere for an accepted event to go.
+
+            It also registers a Redis health indicator into /actuator/health, so the
+            endpoint reports DOWN when Redis is unreachable - which is what makes the
+            Week 4 readiness probe meaningful (proven in 4i, re-proven in 8a).
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-redis</artifactId>
+        </dependency>
 
         <!--
-            Week 2 adds:
-              spring-boot-starter-data-redis  -> enqueue jobs (1d: the queue decouples)
-              spring-boot-starter-validation  -> @Valid input + SSRF checks (3b)
+            WHY: this is the ENGINE for the constraints declared on Event in common.
+            common ships jakarta.validation-api - the annotation definitions only, no
+            logic. This starter brings Hibernate Validator, which actually reads them.
+
+            Without it, @Valid on a controller parameter is silently inert: every
+            @NotBlank and @Pattern on Event is ignored, malformed input is accepted,
+            and nothing anywhere reports that validation never ran.
+
+            The worker deliberately does NOT get this - it processes jobs the producer
+            already validated, so it pays nothing for rules it never enforces.
         -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-validation</artifactId>
+        </dependency>
+
+        <!-- Also inherited from the root: spring-boot-starter-test (all modules) -->
 
     </dependencies>
 
