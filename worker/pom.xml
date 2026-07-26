@@ -43,13 +43,51 @@
             <artifactId>spring-boot-starter</artifactId>
         </dependency>
 
+        <!--
+            WHY: the worker's whole existence is reading jobs OFF the queue the
+            producer fills. This brings Lettuce (the Redis client) plus Spring's
+            StringRedisTemplate, and auto-configures the connection from the
+            spring.data.redis.* properties. Without it the worker has no way to
+            reach the queue at all.
+
+            Same starter the producer uses (8a) — deliberately. The two services
+            talk to the same Redis with the same client, so a behaviour that works
+            on one side is not a surprise on the other.
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-redis</artifactId>
+        </dependency>
+
+        <!--
+            WHY: WebClient — the HTTP client the worker uses to POST webhooks to
+            subscriber URLs (9c). It ships inside the WebFlux starter; there is no
+            smaller artifact that provides it.
+
+            ⚠️ THE TRAP: this starter also contains a reactive Netty web SERVER.
+            Spring Boot picks its application type from the classpath, and webflux
+            present + spring-webmvc absent normally means "start a reactive server
+            on a port". That is the opposite of what a daemon wants.
+
+            spring.main.web-application-type=none (already set in
+            application.properties since 5f) overrides that inference and keeps the
+            worker serverless. That property was documentation before this line
+            existed; adding webflux is what makes it load-bearing.
+
+            The alternative — Java's built-in java.net.http.HttpClient, no
+            dependency at all — is rejected because WebClient gives a per-request
+            timeout, connection pooling, and a filter chain for the HMAC signing
+            header in Session 3, all of which we would otherwise hand-roll.
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-webflux</artifactId>
+        </dependency>
+
         <!-- Also inherited from the root: spring-boot-starter-test (all modules) -->
 
         <!--
-            Week 2 adds:
-              spring-boot-starter-data-redis -> pull jobs from the queue (2c)
-              spring-boot-starter-webflux    -> WebClient for OUTBOUND POSTs (2a)
-                                                (the HTTP client, not a server)
+            Task 10 adds:
               spring-boot-starter-data-jpa
               postgresql                     -> the delivery log (2b) — worker only,
                                                 the producer never touches Postgres
