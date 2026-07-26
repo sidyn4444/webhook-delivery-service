@@ -1,11 +1,7 @@
 package io.github.sidyn4444.webhooks.worker;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import org.springframework.boot.CommandLineRunner;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
-import org.springframework.context.annotation.Bean;
 
 /**
  * Entry point for the worker service.
@@ -21,32 +17,24 @@ import org.springframework.context.annotation.Bean;
  * to reach — a door in a room nobody visits.
  *
  * <p><b>A consequence worth understanding:</b> with no web server, nothing holds the
- * JVM open. The producer stays running because Tomcat keeps a non-daemon thread alive;
- * this application starts, runs the {@link CommandLineRunner} below, and exits cleanly.
- * That is the correct Week-1 behaviour and is exactly what proves the wiring works.
- * In Week 2 the job-polling loop becomes the thing that keeps the process alive.
+ * JVM open. A JVM exits once its last non-daemon thread finishes, and the producer keeps
+ * running only because Tomcat holds one. Through Session 1 this application started, ran
+ * the {@link CommandLineRunner} below, and exited within a second — the correct behaviour
+ * for a program with nothing to do.
+ *
+ * <p>The {@code JobPoller} added in 9b now supplies that thread: its polling loop runs on a
+ * dedicated non-daemon thread and never finishes, so the JVM stays up for as long as the
+ * worker is consuming the queue. {@code spring.main.keep-alive=true} remains in configuration
+ * as a safety net, but it is no longer the mechanism.
+ *
+ * <p>This class is now nothing but an entry point, which is the intended end state. All of the
+ * worker's behaviour lives in components discovered by component scanning.
  */
 @SpringBootApplication
 public class WorkerApplication {
-
-    private static final Logger log = LoggerFactory.getLogger(WorkerApplication.class);
 
     public static void main(String[] args) {
         SpringApplication.run(WorkerApplication.class, args);
     }
 
-    /**
-     * Runs once after the Spring context is fully built, then returns.
-     *
-     * <p>Week-1 scaffolding only: it proves the context started, configuration resolved,
-     * and dependency injection is working, without a queue to poll yet. Week 2 replaces
-     * this with the RPOPLPUSH/ack loop from the worker protocol.
-     */
-    @Bean
-    CommandLineRunner startupProbe() {
-        return args -> {
-            log.info("Worker started — Spring context up, no web server (daemon mode).");
-            log.info("Week 2 replaces this with the Redis job-polling loop.");
-        };
-    }
 }
