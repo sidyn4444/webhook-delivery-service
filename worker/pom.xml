@@ -84,13 +84,62 @@
             <artifactId>spring-boot-starter-webflux</artifactId>
         </dependency>
 
+        <!--
+            WHY: the delivery log (2b). Every attempt — success or failure — becomes a
+            durable row in Postgres, because a log line answers "what is happening now"
+            and nothing answers "what happened to event X last Tuesday" once the log
+            has rotated away.
+
+            WORKER ONLY. The producer never touches Postgres: it accepts an event and
+            queues it, and it has no outcome to record. Adding this dependency there
+            would give it a database connection it has no use for — more startup time,
+            more attack surface, and a service that fails to start when a database it
+            never queries is down.
+
+            WHAT THIS STARTER ACTUALLY BRINGS: Spring Data JPA (the repository layer),
+            Hibernate (the JPA implementation that turns annotated objects into SQL),
+            and HikariCP (the connection pool). Note that Hibernate is NOT part of
+            Spring — it is a separate library that Spring Boot bundles as its default
+            choice. Our code depends on the jakarta.persistence annotations, not on
+            Hibernate classes, which is what would make swapping it a pom change rather
+            than a rewrite.
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-jpa</artifactId>
+        </dependency>
+
+        <!--
+            WHY: JPA is useless on its own. Java ships JDBC as an INTERFACE — a set of
+            method names with no working code behind them — because it cannot know which
+            database you chose. This jar is the implementation for Postgres: the classes
+            that actually open a socket to 5432 and encode Postgres's wire protocol.
+            Without it, startup fails with "Cannot load driver class: org.postgresql.Driver".
+
+            <scope>runtime</scope> IS THE INTERESTING PART. Runtime scope means the jar is
+            present when the application RUNS but absent when it COMPILES. Nothing in this
+            codebase names a Postgres class — Hibernate only ever calls the generic
+            java.sql interfaces — so compiling against it would buy nothing and cost
+            something real: it would make `import org.postgresql.*` possible, and the first
+            person who reaches for a vendor-specific type quietly welds the application to
+            one database. The scope makes that a compile error instead of a code review.
+
+            NO <version>: supplied by spring-boot-starter-parent, which pins a driver
+            version tested against this Spring Boot release.
+        -->
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+
         <!-- Also inherited from the root: spring-boot-starter-test (all modules) -->
 
         <!--
-            Task 10 adds:
-              spring-boot-starter-data-jpa
-              postgresql                     -> the delivery log (2b) — worker only,
-                                                the producer never touches Postgres
+            Task 10c adds:
+              flyway-core                    -> versioned schema migrations, so the table
+              flyway-database-postgresql        is created by a reviewed script rather than
+                                                by Hibernate guessing from the entity
         -->
 
     </dependencies>
