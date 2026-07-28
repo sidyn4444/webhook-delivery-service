@@ -133,14 +133,43 @@
             <scope>runtime</scope>
         </dependency>
 
-        <!-- Also inherited from the root: spring-boot-starter-test (all modules) -->
+        <!--
+            WHY: Flyway owns the database schema. It runs the numbered SQL files in
+            src/main/resources/db/migration at startup, in order, exactly once each,
+            and records what it ran in a flyway_schema_history table it maintains.
+
+            The alternative is letting Hibernate generate the schema from the entity
+            (ddl-auto=update). That is rejected outright: `update` only ever ADDS. Rename
+            a field and you get an empty new column, an orphaned old one still holding the
+            only copy of the data, no copy across, and no record anywhere that it happened.
+            In Kubernetes it is worse — a rolling update runs two app versions at once, so
+            two versions disagree about the shape of one table while both write to it.
+
+            The other alternative — running CREATE TABLE by hand — is what a migration file
+            IS, minus the three things that make it survive contact with more than one
+            database: run it automatically, run it once, run them in order. And in
+            Kubernetes nobody is present to run SQL when a pod starts at 3am.
+        -->
+        <dependency>
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-core</artifactId>
+        </dependency>
 
         <!--
-            Task 10c adds:
-              flyway-core                    -> versioned schema migrations, so the table
-              flyway-database-postgresql        is created by a reviewed script rather than
-                                                by Hibernate guessing from the entity
+            WHY SEPARATE: as of Flyway 10, per-database support was split out of the core
+            artifact. flyway-core alone knows the migration machinery but not Postgres
+            dialect specifics, and fails at startup with "Unsupported Database: PostgreSQL".
+            Nothing about this is guessable from the error's first line — worth the comment.
+
+            No <version> on either: both are managed by spring-boot-starter-parent, so the
+            Flyway version is one tested against this Spring Boot release.
         -->
+        <dependency>
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-database-postgresql</artifactId>
+        </dependency>
+
+        <!-- Also inherited from the root: spring-boot-starter-test (all modules) -->
 
     </dependencies>
 
