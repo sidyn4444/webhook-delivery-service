@@ -5,10 +5,14 @@ URLs across a Kubernetes-orchestrated worker pool on AWS EKS — with exponentia
 retries, a dead-letter queue for permanent failures, HMAC-SHA256 request signing, and
 Prometheus/Grafana observability.
 
-> **Status: Week 1 of 6 — foundations.** Design, security architecture, dev environment,
-> and the multi-module Maven skeleton are complete and building. The producer boots and
-> serves `/actuator/health`; the worker boots as a daemon. Delivery logic lands in Week 2.
-> See [Roadmap](#roadmap) for what exists today versus what's coming.
+> **Status: Week 2 of 6 — the pipe works end to end, locally.** `POST /events` validates and
+> enqueues to Redis and returns `202`; a worker pulls jobs with a reliable-queue pattern,
+> delivers them over HTTP with a hard 10s timeout, acknowledges only on a confirmed 2xx, and
+> records every attempt as a durable row in Postgres.
+>
+> **Not built yet:** retries, the dead-letter queue, HMAC signing, and SSRF validation — all
+> Week 3. A failed delivery currently parks in the processing list and stays there. See
+> [Roadmap](#roadmap) for what exists today versus what's coming.
 
 ---
 
@@ -138,6 +142,50 @@ Those two groups are not decoration — `/actuator/health/liveness` and
 `/actuator/health/readiness` are the exact endpoints Kubernetes probes call to decide
 whether to restart a pod or stop routing traffic to it.
 
+### Sending an event end to end
+
+With both processes running, deliver a webhook to any URL that accepts a POST:
+
+```bash
+curl -X POST localhost:8080/events \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "event_id": "3f2504e0-4f89-11d3-9a0c-0305e82c3301",
+        "subscriber_url": "https://example.com/hooks/orders",
+        "payload": "{\"order_id\":8823,\"status\":\"shipped\"}"
+      }'
+# HTTP 202 — accepted, not yet delivered
+```
+
+The `202` is deliberate: the event has been *queued*, not delivered. Returning `200` would
+claim it reached the subscriber, and a caller who believes that will never retry.
+
+Watch it move through the system:
+
+```bash
+# in flight — the job is atomically moved, never deleted, so a crash can't lose it
+docker exec webhook-redis redis-cli -a "$REDIS_PASSWORD" --no-auth-warning \
+  LLEN webhooks:queue
+
+# the durable record — one row per attempt, success or failure
+docker exec -e PGPASSWORD="$POSTGRES_PASSWORD" webhook-postgres \
+  psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+  -c "SELECT event_id, attempt_number, status_code, success, duration_ms
+      FROM delivery_attempts ORDER BY id DESC LIMIT 5;"
+```
+
+```
+              event_id              | attempt_number | status_code | success | duration_ms
+------------------------------------+----------------+-------------+---------+-------------
+ 3f2504e0-4f89-11d3-9a0c-0305e82c33 |              1 |         200 | t       |          87
+ 1111000a-0000-0000-0000-0000000001 |              1 |             | f       |       10024
+```
+
+**`status_code` is nullable on purpose.** The second row is a timeout — no response ever
+arrived, so there is no status code. Writing `500` there would claim the subscriber's server
+reported a failure, when in fact it may have succeeded and simply answered too late. Those
+are different problems with different owners, and only `NULL` says which one happened.
+
 **Tearing down:** `docker compose down` stops the containers and keeps the data volumes.
 Add `-v` to delete the data as well.
 
@@ -145,9 +193,9 @@ Add `-v` to delete the data as well.
 
 | Week | Scope | Status |
 |---|---|---|
-| 1 | Distributed-systems fundamentals · system design · security architecture · dev environment · multi-module Maven skeleton | **In progress** |
-| 2 | `POST /events` producer · worker pulling from Redis · delivery log via JPA · end-to-end locally | Planned |
-| 3 | Multiple workers · exponential-backoff retry · DLQ · HMAC signing · SSRF validation · JUnit/Mockito suite (80% target) | Planned |
+| 1 | Distributed-systems fundamentals · system design · security architecture · dev environment · multi-module Maven skeleton | ✅ **Complete** |
+| 2 | `POST /events` producer · worker pulling from Redis · delivery log via JPA · end-to-end locally | ✅ **Complete** |
+| 3 | Multiple workers · exponential-backoff retry · DLQ · HMAC signing · SSRF validation · JUnit/Mockito suite (80% target) | **Next** |
 | 4 | Dockerfiles (multi-stage, distroless, non-root) · Kubernetes manifests · local deploy to minikube | Planned |
 | 5 | AWS EKS via eksctl · ElastiCache + RDS in private subnets · ALB Ingress · HTTPS via ACM · IRSA | Planned |
 | 6 | Prometheus + Grafana via Helm · dashboards · load testing · documented chaos test · benchmarks | Planned |
@@ -155,4 +203,4 @@ Add `-v` to delete the data as well.
 ---
 
 *Built as a self-directed project to work through distributed-systems fundamentals,
-container orchestration, and cloud deployment end to end. 
+container orchestration, and cloud deployment end to end.*
