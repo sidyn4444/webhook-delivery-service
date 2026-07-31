@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import io.github.sidyn4444.webhooks.common.model.DeliveryJob;
+import io.github.sidyn4444.webhooks.common.model.DlqEntry;
 
 /**
  * Converts a {@link DeliveryJob} to the JSON string stored in Redis, and back.
@@ -102,6 +103,45 @@ public final class JobCodec {
             return MAPPER.readValue(json, DeliveryJob.class);
         } catch (Exception e) {
             throw new IllegalArgumentException("Failed to deserialize DeliveryJob from queue", e);
+        }
+    }
+
+    /**
+     * Serializes a dead-letter entry to the JSON string pushed onto the dead-letter queue.
+     *
+     * <p>Handled by the same mapper as jobs, deliberately. The dead-letter queue is a second wire
+     * format living in the same Redis, read by the same kinds of tools and by people running
+     * {@code redis-cli}, and there is no reason for it to render timestamps differently or to
+     * behave differently when a field is added. <b>One configuration means one set of surprises,
+     * not two.</b>
+     *
+     * <p>In particular the forward-compatibility setting matters here for the same reason it does
+     * for jobs: a dead letter can sit in Redis for days, so a future version of this record must
+     * be able to read entries written by today's.
+     */
+    public static String toJson(DlqEntry entry) {
+        try {
+            return MAPPER.writeValueAsString(entry);
+        } catch (Exception e) {
+            throw new IllegalStateException(
+                    "Failed to serialize DlqEntry for event " + entry.eventId(), e);
+        }
+    }
+
+    /**
+     * Rebuilds a dead-letter entry from the JSON string read off the dead-letter queue.
+     *
+     * <p>Nothing in the delivery path calls this — the worker only ever writes to the DLQ. It
+     * exists because a queue you can only write to is a bucket, and the entries are meant to be
+     * read: by a replay tool, an admin endpoint, or a support script. Providing the read side now
+     * keeps the format symmetric and makes it testable by round trip, which is the only way to
+     * prove a serializer and a deserializer actually agree.
+     */
+    public static DlqEntry dlqEntryFromJson(String json) {
+        try {
+            return MAPPER.readValue(json, DlqEntry.class);
+        } catch (Exception e) {
+            throw new IllegalArgumentException("Failed to deserialize DlqEntry from the DLQ", e);
         }
     }
 }
