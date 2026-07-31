@@ -3,10 +3,14 @@ package io.github.sidyn4444.webhooks.worker.queue;
 import io.github.sidyn4444.webhooks.common.queue.RedisKeys;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.core.io.ClassPathResource;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.stereotype.Component;
 
+import java.time.Duration;
 import java.time.Instant;
+import java.util.List;
 
 /**
  * Records when each in-flight job was picked up, and forgets it when the job is let go.
@@ -57,6 +61,20 @@ import java.time.Instant;
 public class InFlightIndex {
 
     private static final Logger log = LoggerFactory.getLogger(InFlightIndex.class);
+
+    /**
+     * The recovery sweep, as one uninterruptible Redis operation.
+     *
+     * <p>Loaded from a file rather than pasted into a Java string for the ordinary reasons a query
+     * belongs in its own file: it stays readable, a reviewer sees it as Lua, and an editor can
+     * highlight it. The script itself carries the argument for why it must be atomic.
+     *
+     * <p>Spring sends the whole script with {@code EVAL} the first time and only its SHA hash with
+     * {@code EVALSHA} afterwards, falling back automatically if Redis has forgotten it — so the text
+     * crosses the network once per Redis restart, not once per pass.
+     */
+    private static final RedisScript<List> SWEEP_SCRIPT =
+            RedisScript.of(new ClassPathResource("scripts/reclaim-stale-jobs.lua"), List.class);
 
     private final StringRedisTemplate redis;
 
@@ -180,6 +198,100 @@ public class InFlightIndex {
             // outcome is a stale entry, and the sweep is required to tolerate those anyway.
             log.error("FAILED to clear a pickup time from '{}' — a stale entry is left behind: {}",
                     RedisKeys.INFLIGHT, e.toString());
+        }
+    }
+
+    /**
+     * What one sweep pass did.
+     *
+     * <p>Three numbers rather than one, because they mean completely different things and a single
+     * "jobs handled" count would hide all of it:
+     *
+     * <ul>
+     *   <li><b>adopted</b> — jobs found parked with no pickup time, now stamped. A steady trickle is
+     *       normal and expected (it is the pop/stamp gap). A flood means workers are dying between
+     *       those two commands, which points at something killing pods mid-pickup.</li>
+     *   <li><b>pruned</b> — index entries for jobs that were no longer parked. Bookkeeping litter,
+     *       harmless, but a rising count means release paths are failing to clear their entries.</li>
+     *   <li><b>reclaimed</b> — actual abandoned work put back on the queue. This is the number that
+     *       represents recovered deliveries, and every one of them is a worker that died.</li>
+     * </ul>
+     *
+     * @param adopted   orphans given a pickup time this pass
+     * @param pruned    stale index entries discarded this pass
+     * @param reclaimed the jobs re-queued this pass, as their raw JSON
+     */
+    public record SweepResult(long adopted, long pruned, List<String> reclaimed) {
+
+        static final SweepResult EMPTY = new SweepResult(0, 0, List.of());
+
+        /** True if this pass did nothing at all — used to keep the log quiet on a healthy system. */
+        public boolean isEmpty() {
+            return adopted == 0 && pruned == 0 && reclaimed.isEmpty();
+        }
+    }
+
+    /**
+     * Runs one recovery pass: adopt orphans, then reclaim anything abandoned.
+     *
+     * <p>Both phases happen inside Redis, in one script, with nothing else running in between. That
+     * is not an optimisation — it is the correctness requirement. Every worker runs a sweep thread
+     * over these same keys, so a version written as "read the stale ones, then move them" would have
+     * every worker read the same answer and every worker act on it, producing a duplicate delivery
+     * per worker per pass under entirely normal operation. See the script for why neither ordering
+     * of the separate commands is correct.
+     *
+     * <p><b>The move is already finished by the time this returns.</b> The returned jobs are a
+     * report, not a to-do list — they exist so the caller can log which events were recovered, which
+     * is what makes "why was event X delivered twice?" answerable later.
+     *
+     * <p><b>Never throws.</b> A Redis failure returns an empty result and the sweep tries again next
+     * tick. Nothing is lost by that: the jobs stay parked with their timestamps and simply come back
+     * a little later. Letting the exception escape would kill the sweep thread and leave a process
+     * that looks healthy while never recovering anything again (notes 9b).
+     *
+     * @param now        the moment this pass judges against
+     * @param staleAfter how long a job may be in flight before it is considered abandoned. Derived
+     *                   from the delivery timeout, not chosen freely — a delivery cannot exceed 10
+     *                   seconds (9c), so anything older than this could not still be running.
+     * @param limit      the most jobs to touch per phase, bounding how long Redis is occupied
+     * @return what the pass did; never {@code null}
+     */
+    @SuppressWarnings("unchecked")
+    public SweepResult sweep(Instant now, Duration staleAfter, int limit) {
+        try {
+            long nowMillis = now.toEpochMilli();
+
+            // The cutoff is computed here rather than in Lua so the script takes plain numbers and
+            // holds no policy: it is told which instant counts as stale, and applies it.
+            long staleBefore = nowMillis - staleAfter.toMillis();
+
+            List<Object> result = (List<Object>) redis.execute(
+                    SWEEP_SCRIPT,
+                    List.of(RedisKeys.PROCESSING, RedisKeys.INFLIGHT, RedisKeys.QUEUE),
+                    Long.toString(nowMillis),
+                    Long.toString(staleBefore),
+                    Integer.toString(limit));
+
+            // A script that could not run at all comes back null. Normalising here means no caller
+            // has to decide what null means — the same reasoning as RetryQueue.claimDue (12d).
+            if (result == null || result.size() < 3) {
+                return SweepResult.EMPTY;
+            }
+
+            // Lua numbers arrive as Long, and a Lua table as a List. The order matches the script's
+            // final line: { adopted, pruned, reclaimed }.
+            long adopted = ((Number) result.get(0)).longValue();
+            long pruned = ((Number) result.get(1)).longValue();
+            List<String> reclaimed = (List<String>) result.get(2);
+
+            return new SweepResult(adopted, pruned, reclaimed == null ? List.of() : reclaimed);
+
+        } catch (Exception e) {
+            log.error("Recovery sweep failed — parked jobs keep their timestamps and will be "
+                            + "reclaimed on a later pass: {}",
+                    e.toString());
+            return SweepResult.EMPTY;
         }
     }
 
