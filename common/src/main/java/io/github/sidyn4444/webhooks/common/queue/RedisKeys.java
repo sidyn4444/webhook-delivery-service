@@ -63,6 +63,34 @@ public final class RedisKeys {
     public static final String PROCESSING = NAMESPACE + "processing";
 
     /**
+     * Jobs waiting out a backoff before their next attempt.
+     *
+     * <p><b>This is the one key here that is not a list.</b> It is a Redis <i>sorted set</i>:
+     * every entry carries a number alongside it, and Redis keeps the whole thing permanently
+     * ordered by that number. Here the number is the <b>absolute clock time, in epoch
+     * milliseconds, at which the job becomes due</b>.
+     *
+     * <p>The reason it cannot be a list is the reason for the whole structure. A list answers
+     * one question — <i>what is next in line?</i> — and jobs here do not leave in the order they
+     * arrived. A job scheduled second with a 1-second backoff is due long before a job scheduled
+     * first with a 16-second one. What is needed is a different question entirely: <i>which of
+     * these are due yet?</i> That is a range query, and a sorted set is the only Redis structure
+     * that answers one without reading everything.
+     *
+     * <p><b>Where {@link #PROCESSING} keeps time as a failsafe, this keeps time as the
+     * instruction.</b> A job in {@code PROCESSING} is being worked on right now and its pickup
+     * time only matters if something goes wrong; a job here is doing nothing at all until its
+     * time arrives, so the time is the only thing that makes it actionable. That difference is
+     * why {@code PROCESSING} can be a list with a separate index beside it while this cannot
+     * (notes 12c, 14a).
+     *
+     * <p>Nothing polls this key for work. A scheduler asks it one question on a loop — "anything
+     * due by now?" — and moves whatever comes back onto {@link #QUEUE}, where an ordinary worker
+     * picks it up with no idea it was ever a retry.
+     */
+    public static final String RETRY = NAMESPACE + "retry";
+
+    /**
      * The dead-letter queue: jobs that failed permanently — either a non-retriable response
      * or the retry ceiling reached (notes 2e).
      *
