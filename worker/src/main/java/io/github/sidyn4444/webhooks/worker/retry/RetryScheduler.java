@@ -5,9 +5,8 @@ import io.github.sidyn4444.webhooks.common.model.DeliveryJob;
 import io.github.sidyn4444.webhooks.common.queue.RedisKeys;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import jakarta.annotation.PostConstruct;
-import jakarta.annotation.PreDestroy;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.SmartLifecycle;
 import org.springframework.stereotype.Component;
 
 import java.time.Duration;
@@ -51,7 +50,7 @@ import java.util.List;
  * that needs no coordination over one that coordinates well.</b>
  */
 @Component
-public class RetryScheduler {
+public class RetryScheduler implements SmartLifecycle {
 
     private static final Logger log = LoggerFactory.getLogger(RetryScheduler.class);
 
@@ -92,6 +91,30 @@ public class RetryScheduler {
 
     private Thread schedulerThread;
 
+    /**
+     * Stopped one step BEFORE the poll loop, and well before the Redis connection.
+     *
+     * <p>Spring stops lifecycle beans in descending phase order, and
+     * {@code LettuceConnectionFactory} sits at phase {@code 0} — so anything that talks to Redis
+     * has to be above it or it will find the connection already gone. The full story is on
+     * {@code JobPoller.getPhase()}, where the same number fixes the same defect.
+     *
+     * <p>Why one step above the poll loop rather than the same phase: this class <i>produces</i>
+     * work and the poll loop <i>consumes</i> it. Stopping the producer first means the queue is not
+     * still growing while the consumer is trying to finish. Nothing breaks if the order were
+     * reversed — a promoted job simply waits on the queue for another pod — but "stop feeding
+     * before you stop eating" is the shape that needs no explanation.
+     */
+    @Override
+    public int getPhase() {
+        return Integer.MAX_VALUE;
+    }
+
+    @Override
+    public boolean isRunning() {
+        return running;
+    }
+
     public RetryScheduler(RetryQueue retryQueue,
                           @Value("${webhook.retry.poll-interval:1s}") Duration pollInterval,
                           @Value("${webhook.retry.batch-size:100}") int batchSize) {
@@ -100,7 +123,7 @@ public class RetryScheduler {
         this.batchSize = batchSize;
     }
 
-    @PostConstruct
+    @Override
     public void start() {
         running = true;
         schedulerThread = new Thread(this::runForever, "retry-scheduler");
@@ -178,7 +201,7 @@ public class RetryScheduler {
                 promoted.size(), RedisKeys.RETRY, RedisKeys.QUEUE, retryQueue.size());
     }
 
-    @PreDestroy
+    @Override
     public void stop() {
         log.info("Shutdown requested — stopping retry scheduler.");
         running = false;

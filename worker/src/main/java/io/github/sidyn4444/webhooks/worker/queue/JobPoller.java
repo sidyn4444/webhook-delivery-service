@@ -7,10 +7,9 @@ import io.github.sidyn4444.webhooks.worker.delivery.DeliveryResult;
 import io.github.sidyn4444.webhooks.worker.delivery.WebhookSender;
 import io.github.sidyn4444.webhooks.worker.persistence.DeliveryAttempt;
 import io.github.sidyn4444.webhooks.worker.persistence.DeliveryAttemptRepository;
-import jakarta.annotation.PostConstruct;
-import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.context.SmartLifecycle;
 import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
@@ -48,7 +47,7 @@ import java.time.Duration;
  * dead-lettering and the sweep itself are Session 3; until then a failure simply parks.
  */
 @Component
-public class JobPoller {
+public class JobPoller implements SmartLifecycle {
 
     private static final Logger log = LoggerFactory.getLogger(JobPoller.class);
 
@@ -97,9 +96,59 @@ public class JobPoller {
      * this keyword the polling thread could keep reading a stale {@code true} indefinitely and
      * never stop. {@code volatile} forces every read to come from main memory.
      */
-    private volatile boolean running = true;
+    private volatile boolean running = false;
 
     private Thread pollThread;
+
+    /**
+     * When this bean is stopped relative to everything else in the application.
+     *
+     * <p>🔴 This number is the fix for a real defect, and the reasoning is worth keeping.
+     *
+     * <p>Spring shuts down in two distinct passes: first it calls {@code stop()} on every bean
+     * implementing {@code Lifecycle}, then it runs {@code @PreDestroy} and {@code destroy()} on
+     * everything. {@code LettuceConnectionFactory} — the Redis connection — implements
+     * {@code SmartLifecycle} and returns phase {@code 0}.
+     *
+     * <p>So while this class used {@code @PreDestroy} to stop the loop, the ordering was:
+     *
+     * <pre>
+     *   t+0.0s   Redis connection stopped        (lifecycle pass)
+     *   t+0.0s   poll loop still running, its next Redis call fails
+     *   t+2.0s   more failures
+     *   t+2.1s   @PreDestroy finally asks the loop to stop   ← two seconds too late
+     * </pre>
+     *
+     * <p>The visible symptom was a handful of ERROR lines on every clean shutdown. The real
+     * symptom was worse: <b>a pod terminated mid-delivery would complete the delivery and then
+     * fail to acknowledge it</b>, because Redis was already gone — so the job stayed parked and
+     * was re-delivered. On Kubernetes, where every rolling update terminates every pod, that is a
+     * duplicate on every deploy rather than an edge case.
+     *
+     * <p>Lifecycle beans are stopped in <b>descending</b> phase order, so a phase above 0 stops
+     * before the connection it depends on is taken away. {@code Integer.MAX_VALUE - 1} leaves one
+     * step above it for the retry scheduler, which should stop first — no point promoting more
+     * jobs onto a queue nobody is draining any more.
+     *
+     * <p>The general rule this is an instance of: <b>a component that uses a resource must be
+     * stopped before the resource is closed, and with Spring's two-pass shutdown that ordering is
+     * expressed with lifecycle phases, not with {@code @PreDestroy}.</b>
+     */
+    @Override
+    public int getPhase() {
+        return Integer.MAX_VALUE - 1;
+    }
+
+    /**
+     * Whether the loop is currently running.
+     *
+     * <p>Spring calls this to decide whether {@link #stop()} needs calling at all, so getting it
+     * wrong means a shutdown hook that silently never fires.
+     */
+    @Override
+    public boolean isRunning() {
+        return running;
+    }
 
     public JobPoller(StringRedisTemplate redis, WebhookSender sender,
                      DeliveryAttemptRepository attempts) {
@@ -111,8 +160,12 @@ public class JobPoller {
     /**
      * Verifies Redis is genuinely reachable, then starts the polling thread.
      *
-     * <p>{@code @PostConstruct} runs once after this bean is constructed and injected, during
-     * application startup.
+     * <p>Called by Spring during startup, once every bean is constructed and wired — slightly
+     * later than {@code @PostConstruct}, which is where this used to live. It moved because
+     * shutdown had to move (see {@link #getPhase()}), and start and stop belong together: a
+     * component started by one mechanism and stopped by another is exactly how the ordering bug
+     * got in. Throwing from here still fails application startup, so the fail-fast behaviour below
+     * is unchanged.
      *
      * <p>The PING is here rather than in a startup probe elsewhere because this is the class
      * that cannot function without Redis, and an assertion belongs next to the thing it
@@ -127,10 +180,12 @@ public class JobPoller {
      * the process should refuse to start; Redis unreachable an hour later is probably a blip
      * worth surviving. Same failure, different meaning, because the timing carries information.
      */
-    @PostConstruct
-    void start() {
+    @Override
+    public void start() {
         String pong = redis.execute((RedisCallback<String>) connection -> connection.ping());
         log.info("Redis reachable (PING -> {}). Starting poll loop on '{}'.", pong, RedisKeys.QUEUE);
+
+        running = true;
 
         // A thread created here inherits the daemon status of the thread that creates it, and
         // startup runs on the main (non-daemon) thread — so this is a NON-DAEMON thread, and
@@ -340,8 +395,10 @@ public class JobPoller {
     /**
      * Asks the loop to finish and waits briefly for it.
      *
-     * <p>{@code @PreDestroy} runs when the application context shuts down — on Ctrl-C, or when
-     * Kubernetes sends SIGTERM to a pod during a rollout.
+     * <p>Called by Spring during the lifecycle-stop pass, which happens on Ctrl-C or when
+     * Kubernetes sends SIGTERM to a pod during a rollout — and, critically, <b>before</b> the Redis
+     * connection this loop depends on is closed. See {@link #getPhase()} for why that ordering had
+     * to be made explicit.
      *
      * <p>Without this the process would be killed wherever it happened to be, potentially
      * mid-delivery. Kubernetes replaces pods constantly, so "shut down cleanly" is not an edge
@@ -354,15 +411,23 @@ public class JobPoller {
      * exits on its own terms. The cost is that shutdown can take up to five seconds — well
      * inside Kubernetes' default 30-second termination grace period.
      */
-    @PreDestroy
-    void stop() throws InterruptedException {
+    @Override
+    public void stop() {
         log.info("Shutdown requested — stopping poll loop.");
         running = false;
 
         if (pollThread != null) {
-            // Wait a little longer than one full block, so a loop parked in Redis has time to
-            // return and exit cleanly rather than being abandoned.
-            pollThread.join(BLOCK_TIMEOUT.plusSeconds(2).toMillis());
+            try {
+                // Wait a little longer than one full block, so a loop parked in Redis has time to
+                // return and exit cleanly rather than being abandoned.
+                pollThread.join(BLOCK_TIMEOUT.plusSeconds(2).toMillis());
+            } catch (InterruptedException e) {
+                // The shutdown itself was interrupted. Restore the flag so anything above this
+                // frame can still see it, and stop waiting — the flag is already set, so the loop
+                // will exit on its own as soon as its current block expires.
+                Thread.currentThread().interrupt();
+                log.warn("Interrupted while waiting for the poll loop to finish.");
+            }
         }
     }
 
