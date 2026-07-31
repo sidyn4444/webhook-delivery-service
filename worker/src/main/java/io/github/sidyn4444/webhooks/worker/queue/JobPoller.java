@@ -1,12 +1,14 @@
 package io.github.sidyn4444.webhooks.worker.queue;
 
 import io.github.sidyn4444.webhooks.common.model.DeliveryJob;
+import io.github.sidyn4444.webhooks.common.model.DlqReason;
 import io.github.sidyn4444.webhooks.common.queue.JobCodec;
 import io.github.sidyn4444.webhooks.common.queue.RedisKeys;
 import io.github.sidyn4444.webhooks.worker.delivery.DeliveryClassifier;
 import io.github.sidyn4444.webhooks.worker.delivery.DeliveryOutcome;
 import io.github.sidyn4444.webhooks.worker.delivery.DeliveryResult;
 import io.github.sidyn4444.webhooks.worker.delivery.WebhookSender;
+import io.github.sidyn4444.webhooks.worker.dlq.DeadLetterQueue;
 import io.github.sidyn4444.webhooks.worker.persistence.DeliveryAttempt;
 import io.github.sidyn4444.webhooks.worker.persistence.DeliveryAttemptRepository;
 import io.github.sidyn4444.webhooks.worker.retry.RetryBackoff;
@@ -47,9 +49,11 @@ import java.time.Instant;
  * gone. There is no state in which it exists nowhere, which is what makes at-least-once delivery
  * a mechanical property rather than an intention.
  *
- * <p><b>As of 12e a retriable failure no longer parks.</b> It is classified (12a), given a
- * jittered wait (12b), written into the retry set (12c) and released — so the only jobs still
- * left in {@code processing} are the two give-up roads, which Task 13 turns into dead letters.
+ * <p><b>As of 13b every job now has an ending.</b> A failure is classified (12a) and either
+ * scheduled for another attempt (12e) or dead-lettered (13b), and in both cases it is removed from
+ * {@code processing} once the durable record exists. Nothing is left parked by design any more —
+ * so from here on, a job still sitting in {@code processing} means a worker died holding it, which
+ * is precisely the signal the recovery sweep looks for (14b).
  */
 @Component
 public class JobPoller implements SmartLifecycle {
@@ -103,6 +107,18 @@ public class JobPoller implements SmartLifecycle {
      * retry dies with it. Redis is the only thing they share.
      */
     private final RetryQueue retryQueue;
+
+    /**
+     * Where a job goes when the system stops trying (13a/13b).
+     *
+     * <p>Three branches in this class reach it, and each one passes its own reason as a constant.
+     * That is deliberate and is the reason the reason is a parameter rather than something the
+     * dead-letter queue works out for itself: <b>the classification is context that exists only at
+     * the branch.</b> A job that got a 404 on its first attempt and a job that exhausted five
+     * retries are indistinguishable once they are just a variable — the difference is which line of
+     * code the call came from, and passing it along is how that survives the call.
+     */
+    private final DeadLetterQueue deadLetters;
 
     /**
      * The shutdown flag.
@@ -167,11 +183,13 @@ public class JobPoller implements SmartLifecycle {
     }
 
     public JobPoller(StringRedisTemplate redis, WebhookSender sender,
-                     DeliveryAttemptRepository attempts, RetryQueue retryQueue) {
+                     DeliveryAttemptRepository attempts, RetryQueue retryQueue,
+                     DeadLetterQueue deadLetters) {
         this.redis = redis;
         this.sender = sender;
         this.attempts = attempts;
         this.retryQueue = retryQueue;
+        this.deadLetters = deadLetters;
     }
 
     /**
@@ -264,12 +282,20 @@ public class JobPoller implements SmartLifecycle {
         try {
             job = JobCodec.fromJson(json);
         } catch (IllegalArgumentException e) {
-            // Unparseable content on the queue. It has already been moved into processing by
-            // the atomic pop, and it deliberately stays there: silently discarding data nobody
-            // can read destroys the only evidence of a bug. Parking it keeps the evidence and
-            // keeps the loop running. Task 13 routes this to the dead-letter queue, which is
-            // where a permanently unprocessable message belongs.
-            log.error("Unparseable job left parked in '{}': {}", RedisKeys.PROCESSING, e.toString());
+            // 🔴 THE THIRD ROAD TO THE DEAD-LETTER QUEUE, and the one that is easy to leave out.
+            //
+            // Until now this message was parked in 'processing' and left there. That was harmless
+            // only because nothing ever looked at that list. Once the recovery sweep exists (14b)
+            // it becomes an infinite loop — picked up, unparseable, parked, swept, re-queued,
+            // forever — and the attempt ceiling cannot stop it, because attemptNumber and
+            // maxRetries both live inside the job and reading the job is what just failed. There
+            // is nothing to count. Dead-lettering on the spot is the only exit.
+            //
+            // Note what is NOT recorded: no Postgres row. The delivery log is keyed on an event id
+            // and there is no event id here, because nothing could be read out of the message. The
+            // dead letter is the only record this failure gets, which is precisely why it has to
+            // carry the raw bytes.
+            deadLetters.deadLetterUnparseable(json, describeParseFailure(e));
             return;
         }
 
@@ -327,12 +353,16 @@ public class JobPoller implements SmartLifecycle {
      *
      * <ol>
      *   <li><b>Permanent</b> — the request itself is wrong, so retrying reproduces the rejection
-     *       exactly. Straight to the dead-letter queue (Task 13).</li>
+     *       exactly. Straight to the dead-letter queue (13b).</li>
      *   <li><b>Retriable, attempts exhausted</b> — transient, but it has had every attempt it was
-     *       promised. Also dead-lettered, by the other road (Task 13).</li>
+     *       promised. Also dead-lettered, by the other road (13b).</li>
      *   <li><b>Retriable, attempts remaining</b> — schedule the next one and release this job.</li>
      * </ol>
      *
+     * <p>Two of the three roads end in a dead letter, and each passes its own {@link DlqReason} as
+     * a literal constant. The branch already did the deciding; the constant only names where the
+     * code is. Working the reason out again inside the dead-letter queue would put the retry policy
+     * in two files, and the day they drift nothing errors — the entries are just mislabelled.
      */
     private void handleFailure(String json, DeliveryJob job, DeliveryResult result) {
         DeliveryOutcome outcome = DeliveryClassifier.classify(result);
@@ -340,18 +370,23 @@ public class JobPoller implements SmartLifecycle {
         if (outcome == DeliveryOutcome.PERMANENT) {
             // The immediate road to the DLQ (notes 2e). Nothing about waiting would help: a 404 is
             // a statement about this URL and will be equally true in sixteen seconds.
-            log.warn("PERMANENT failure for event {} -> {}. No retry; job left in '{}' "
-                            + "(Task 13 will dead-letter it).",
-                    job.eventId(), result.describe(), RedisKeys.PROCESSING);
+            //
+            // The reason is a hardcoded constant rather than something computed, because reaching
+            // this branch IS the fact. DeliveryClassifier already did the thinking (12a); there is
+            // nothing left to work out here, only somewhere to name it.
+            deadLetters.deadLetter(json, job, DlqReason.NON_RETRIABLE_RESPONSE, result);
             return;
         }
 
         if (!job.hasRetriesLeft()) {
             // The exhausted road to the DLQ — the one people forget when describing retry logic,
             // and the one interviewers probe with "so what happens after the last retry fails?"
-            log.warn("Event {} EXHAUSTED its {} attempts (last: {}). Job left in '{}' "
-                            + "(Task 13 will dead-letter it).",
-                    job.eventId(), job.maxRetries(), result.describe(), RedisKeys.PROCESSING);
+            //
+            // Same shape as above: hasRetriesLeft() counted the attempts, so arriving here is the
+            // classification. A different constant, because a human's response is different — this
+            // one usually means the subscriber was down longer than the retry window, and replaying
+            // it later will probably just work.
+            deadLetters.deadLetter(json, job, DlqReason.RETRIES_EXHAUSTED, result);
             return;
         }
 
@@ -528,6 +563,42 @@ public class JobPoller implements SmartLifecycle {
                 log.warn("Interrupted while waiting for the poll loop to finish.");
             }
         }
+    }
+
+    /**
+     * Turns a parse failure into a short description safe to store and to log.
+     *
+     * <p>🔴 <b>The exception's message is deliberately not used, and the reason is a security one.</b>
+     *
+     * <p>Jackson quotes the offending input back at you. A real message looks like:
+     *
+     * <pre>
+     *   Unrecognized token 'not': was expecting (JSON String, ...)
+     *    at [Source: (String)"{not json at all, and here is the payload"; line: 1, column: 5]
+     * </pre>
+     *
+     * <p>That embedded fragment is <b>unvalidated content of unknown origin</b> — and this is the
+     * one code path where that phrase is literally true, since the message failed to parse and
+     * nothing about it has been checked. Copying it into {@code lastFailureReason} would put a
+     * slice of a possibly-personal payload into a human-readable summary field, and copying it into
+     * a log line would put it somewhere with far weaker access control than the queue it came from.
+     * That is exactly the leak the no-payload-in-logs rule exists to prevent (notes 2b, 10b).
+     *
+     * <p>The exception <i>type</i> carries the diagnosis without the content, and it is genuinely
+     * diagnostic: {@code JsonParseException} means the bytes are not JSON at all — suspect a human
+     * with {@code redis-cli}, or a truncated write. {@code MismatchedInputException} or
+     * {@code ValueInstantiationException} means it was valid JSON that could not become a job —
+     * suspect a version skew, a renamed field, or a message written before a schema change
+     * (notes 13a).
+     *
+     * <p>The full bytes are still preserved, in {@code originalJob} on the entry itself. Nothing is
+     * lost; it is just kept in the access-controlled place rather than the readable-by-everyone one.
+     */
+    private String describeParseFailure(Exception e) {
+        Throwable cause = e.getCause();
+        return cause != null
+                ? "could not be parsed as a job (" + cause.getClass().getSimpleName() + ")"
+                : "could not be parsed as a job (" + e.getClass().getSimpleName() + ")";
     }
 
     private void sleepQuietly(Duration duration) {
