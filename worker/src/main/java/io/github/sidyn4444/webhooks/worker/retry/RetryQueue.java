@@ -5,10 +5,13 @@ import io.github.sidyn4444.webhooks.common.queue.JobCodec;
 import io.github.sidyn4444.webhooks.common.queue.RedisKeys;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.core.io.ClassPathResource;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.stereotype.Component;
 
 import java.time.Instant;
+import java.util.List;
 
 /**
  * Where a job waits between attempts.
@@ -39,6 +42,25 @@ import java.time.Instant;
 public class RetryQueue {
 
     private static final Logger log = LoggerFactory.getLogger(RetryQueue.class);
+
+    /**
+     * The atomic "claim everything that is due and move it to the queue" operation.
+     *
+     * <p>Loaded from {@code resources/scripts/claim-due-retries.lua} rather than pasted into a
+     * Java string, for the ordinary reasons a query belongs in its own file: it stays readable,
+     * a reviewer can see it as Lua, and an editor can highlight it. The script itself explains
+     * why the operation has to be atomic.
+     *
+     * <p><b>How Spring runs it:</b> the first call sends the whole script with {@code EVAL} and
+     * Redis remembers it against a hash of its text. Every later call sends only that hash, with
+     * {@code EVALSHA} — so the script text crosses the network once per Redis restart, not once
+     * per second. Spring handles the fallback automatically if Redis has forgotten it.
+     *
+     * <p>Static because the script is the same for every instance and reading a classpath
+     * resource once is enough.
+     */
+    private static final RedisScript<List> CLAIM_DUE_SCRIPT =
+            RedisScript.of(new ClassPathResource("scripts/claim-due-retries.lua"), List.class);
 
     private final StringRedisTemplate redis;
 
@@ -121,6 +143,54 @@ public class RetryQueue {
             log.error("FAILED to schedule retry for event {} attempt {} — not removing it from '{}': {}",
                     job.eventId(), job.attemptNumber(), RedisKeys.PROCESSING, e.toString());
             return false;
+        }
+    }
+
+    /**
+     * Takes every job whose backoff has expired and puts it back on the main work queue.
+     *
+     * <p>This is the read side, and it is one Redis call — a Lua script that finds the due jobs,
+     * removes them from the retry set and pushes them onto the queue, atomically. The reason it
+     * must be atomic is the whole argument in the script file: every worker runs a scheduler
+     * thread, they all read the same set, and neither ordering of "remove" and "push" is correct
+     * when written as separate calls. One duplicates every job on every pass; the other loses
+     * jobs outright on a crash.
+     *
+     * <p><b>What the caller gets back is a report, not a to-do list.</b> The move has already
+     * happened by the time this returns. The jobs are returned only so the scheduler can log
+     * which events were promoted, which is what makes "why was event X delivered twice?"
+     * answerable later.
+     *
+     * <p><b>Never throws.</b> A Redis outage returns an empty list, so the scheduler thread
+     * treats it as "nothing was due" and tries again next tick. Nothing is lost by that: the
+     * jobs stay in the retry set with their due times, they simply come back late. The
+     * alternative — letting the exception escape — kills the scheduler thread and leaves a
+     * process that looks healthy while no retry ever fires again (notes 9b).
+     *
+     * @param now   the moment to judge against; anything due at or before this is claimed
+     * @param limit the most jobs to move in one pass, bounding how long the script occupies
+     *              Redis's single thread
+     * @return the jobs that were moved, oldest due first; empty if none were due or Redis failed
+     */
+    @SuppressWarnings("unchecked")
+    public List<String> claimDue(Instant now, int limit) {
+        try {
+            List<String> moved = (List<String>) redis.execute(
+                    CLAIM_DUE_SCRIPT,
+                    List.of(RedisKeys.RETRY, RedisKeys.QUEUE),
+                    Long.toString(now.toEpochMilli()),
+                    Integer.toString(limit));
+
+            // A script returning an empty Lua table comes back as an empty list, but a failure to
+            // execute at all can come back null. Normalising here means no caller has to decide
+            // what null means — the same reasoning as checking the LREM return in 9d, one level up.
+            return moved == null ? List.of() : moved;
+
+        } catch (Exception e) {
+            log.error("Could not claim due retries from '{}' — they stay scheduled and will be "
+                            + "picked up on a later pass: {}",
+                    RedisKeys.RETRY, e.toString());
+            return List.of();
         }
     }
 
