@@ -6,6 +6,7 @@ import io.github.sidyn4444.webhooks.common.model.DlqReason;
 import io.github.sidyn4444.webhooks.common.queue.JobCodec;
 import io.github.sidyn4444.webhooks.common.queue.RedisKeys;
 import io.github.sidyn4444.webhooks.worker.delivery.DeliveryResult;
+import io.github.sidyn4444.webhooks.worker.queue.InFlightIndex;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.data.redis.core.StringRedisTemplate;
@@ -64,8 +65,21 @@ public class DeadLetterQueue {
 
     private final StringRedisTemplate redis;
 
-    public DeadLetterQueue(StringRedisTemplate redis) {
+    /**
+     * The pickup-time index (14a). This class is the third and last place a job leaves the
+     * processing list, so it is the third place the corresponding timestamp has to be cleared.
+     *
+     * <p>That there are three such places is the cost of the asymmetry noted in 13b — the retry
+     * path lets the poller do its own release while this class does its own. It is also the reason
+     * the removal is wrapped in a method here rather than written inline at each call: three copies
+     * of "remove from the list, then clear the index, but only if the removal actually removed
+     * something" is three chances to get the condition subtly wrong.
+     */
+    private final InFlightIndex inFlight;
+
+    public DeadLetterQueue(StringRedisTemplate redis, InFlightIndex inFlight) {
         this.redis = redis;
+        this.inFlight = inFlight;
     }
 
     /**
@@ -229,6 +243,12 @@ public class DeadLetterQueue {
             Long removed = redis.opsForList().remove(RedisKeys.PROCESSING, 1, originalJson);
 
             if (removed != null && removed == 1) {
+                // The job has left the processing list, so its pickup time is no longer meaningful
+                // and is cleared (14a). Strictly inside this branch: a job that is still parked —
+                // which is exactly what the error path below reports — must keep its timestamp, or
+                // the recovery sweep will never see that anything is wrong with it.
+                inFlight.forget(originalJson);
+
                 log.info("Released event {} from '{}' — it is now in '{}'",
                         eventIdForLog, RedisKeys.PROCESSING, RedisKeys.DLQ);
                 return;

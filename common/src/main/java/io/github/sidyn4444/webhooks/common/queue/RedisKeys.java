@@ -59,8 +59,43 @@ public final class RedisKeys {
      *
      * <p>It is a holding area, not a second queue: nothing pops from it in order. It exists
      * so that there is always a trace of every job currently being worked on.
+     *
+     * <p>As of 14a it has a companion, {@link #INFLIGHT}, recording <i>when</i> each of these
+     * jobs was picked up — the fact a list cannot hold and the sweep cannot work without.
      */
     public static final String PROCESSING = NAMESPACE + "processing";
+
+    /**
+     * When each job currently in {@link #PROCESSING} was picked up.
+     *
+     * <p>A sorted set whose members are the exact job strings sitting in {@link #PROCESSING} and
+     * whose scores are the pickup time in epoch milliseconds. It answers the one question the
+     * processing list cannot: <b>how long has this been in flight?</b>
+     *
+     * <p>The list on its own says a job is being worked on. It cannot say whether the worker
+     * holding it is alive, because a job being delivered right now and a job abandoned by a pod
+     * that died an hour ago look identical in a list — same string, same position, no timestamp.
+     * With a pickup time attached, staleness becomes measurable: a delivery is capped at ten
+     * seconds (9c), so anything picked up more than sixty seconds ago cannot still be in progress
+     * and the worker that held it is gone (14b).
+     *
+     * <p><b>Note what is deliberately NOT stored: which worker holds it.</b> Ownership without
+     * liveness is not information — knowing a job belongs to {@code worker-7} says nothing about
+     * whether {@code worker-7} still exists, and finding out would mean every worker publishing a
+     * heartbeat and something checking it. Time is the liveness signal, and it needs no
+     * cooperation from anyone: no worker knows anything about any other worker, and correctness
+     * comes entirely from what is in Redis.
+     *
+     * <p><b>This index is a failsafe, not the source of truth.</b> {@link #PROCESSING} is the
+     * source of truth, and the distinction is the reason the pair works at all. A job is moved
+     * into the list atomically as it is picked up, and the timestamp is written immediately after
+     * as a second command — so a crash in between leaves a job in the list with no entry here.
+     * That job is not lost: it is still visible in the list, and the sweep adopts it by writing
+     * the missing timestamp rather than treating it as suspicious (14b). Compare {@link #RETRY},
+     * where the time is <i>the instruction</i> rather than a failsafe and therefore cannot be
+     * split across two keys at all (notes 12c, 14a).
+     */
+    public static final String INFLIGHT = NAMESPACE + "inflight";
 
     /**
      * Jobs waiting out a backoff before their next attempt.

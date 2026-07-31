@@ -121,6 +121,17 @@ public class JobPoller implements SmartLifecycle {
     private final DeadLetterQueue deadLetters;
 
     /**
+     * Records when each job was picked up, so a dead worker's abandoned jobs can be identified
+     * (14a).
+     *
+     * <p>Note the asymmetry with {@link #retryQueue} and {@link #deadLetters}: a failure from
+     * either of those stops this class from releasing the job, because their write is the job's
+     * only future. A failure from this one changes nothing about what happens next. The index is a
+     * failsafe over a list that already holds the job; the two others ARE where the job goes.
+     */
+    private final InFlightIndex inFlight;
+
+    /**
      * The shutdown flag.
      *
      * <p>{@code volatile} is essential and easy to omit. Each CPU core may cache a copy of a
@@ -184,12 +195,13 @@ public class JobPoller implements SmartLifecycle {
 
     public JobPoller(StringRedisTemplate redis, WebhookSender sender,
                      DeliveryAttemptRepository attempts, RetryQueue retryQueue,
-                     DeadLetterQueue deadLetters) {
+                     DeadLetterQueue deadLetters, InFlightIndex inFlight) {
         this.redis = redis;
         this.sender = sender;
         this.attempts = attempts;
         this.retryQueue = retryQueue;
         this.deadLetters = deadLetters;
+        this.inFlight = inFlight;
     }
 
     /**
@@ -251,6 +263,26 @@ public class JobPoller implements SmartLifecycle {
                 if (json == null) {
                     continue; // No work. Re-check the shutdown flag and wait again.
                 }
+
+                // 🔴 THE SECOND HALF OF THE PICKUP, AND IT CANNOT BE PART OF THE FIRST.
+                //
+                // Note the pop is the blocking form of RPOPLPUSH, and blocking commands do not
+                // block inside a Lua script — so "pop and stamp the time" cannot be made one
+                // atomic operation the way the retry claim was (12d). It is unavoidably two
+                // commands with a gap between them.
+                //
+                // A crash in that gap leaves a job in 'processing' with no entry in the index: an
+                // orphan. That is a permanent property of this design rather than a bug to fix,
+                // and it is exactly why the sweep must ADOPT an orphan — write the missing
+                // timestamp — instead of concluding anything from its absence. A healthy worker
+                // that is a microsecond past its pop produces the identical state (14b).
+                //
+                // The return value is deliberately ignored. The index is a failsafe over a list
+                // that already holds the job safely, so a failed timestamp write must not stop a
+                // delivery that has nothing wrong with it. Compare the retry and dead-letter
+                // writes below, where a false return DOES stop the release — there, the write is
+                // the job's only future.
+                inFlight.record(json);
 
                 handle(json);
 
@@ -421,6 +453,14 @@ public class JobPoller implements SmartLifecycle {
         // byte would remove nothing, return 0, and leave a duplicate to be delivered twice (9d).
         Long removed = redis.opsForList().remove(RedisKeys.PROCESSING, 1, json);
 
+        if (removed != null && removed == 1) {
+            // Only now that the job has genuinely left 'processing' does its pickup time stop
+            // meaning anything. Clearing it any earlier — before the LREM, or regardless of what
+            // the LREM returned — would erase the evidence the sweep needs for a job that is still
+            // parked. The index mirrors the list, so it changes exactly when the list changes.
+            inFlight.forget(json);
+        }
+
         if (removed == null || removed == 0) {
             // The retry IS scheduled, so no delivery is lost — but this copy is now stranded in
             // 'processing' and the recovery sweep will eventually re-queue it as well, producing a
@@ -513,6 +553,13 @@ public class JobPoller implements SmartLifecycle {
         Long removed = redis.opsForList().remove(RedisKeys.PROCESSING, 1, json);
 
         if (removed != null && removed == 1) {
+            // The job is out of 'processing', so the pickup time it was stamped with is now
+            // meaningless and is cleared. Deliberately inside this branch: if the LREM had removed
+            // nothing the job would still be parked, and deleting its timestamp would hide it from
+            // the very sweep that exists to rescue it — turning a noisy, recoverable failure into
+            // a silent one.
+            inFlight.forget(json);
+
             log.info("Acked event {} — removed from '{}'", eventId, RedisKeys.PROCESSING);
             return;
         }
