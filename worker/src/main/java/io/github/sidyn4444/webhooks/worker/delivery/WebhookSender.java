@@ -1,6 +1,7 @@
 package io.github.sidyn4444.webhooks.worker.delivery;
 
 import io.github.sidyn4444.webhooks.common.model.DeliveryJob;
+import io.github.sidyn4444.webhooks.common.security.HmacSigner;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -9,6 +10,7 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.reactive.function.client.WebClient;
 
 import java.time.Duration;
+import java.time.Instant;
 
 /**
  * Performs one HTTP POST to a subscriber and reports what happened.
@@ -30,8 +32,28 @@ public class WebhookSender {
 
     private static final Logger log = LoggerFactory.getLogger(WebhookSender.class);
 
+    /**
+     * Carries the event id to the subscriber so they can discard a duplicate delivery.
+     *
+     * <p>This is not decoration. This system delivers <b>at least once</b> — an acknowledged
+     * duplicate is chosen over a lost event at four separate points (notes 9d, 10d, 12e, 13b), and
+     * every one of those decisions is justified by "the subscriber deduplicates on a stable event
+     * id." That justification only holds if the id actually reaches them, and until now the outbound
+     * request contained the payload and nothing else.
+     *
+     * <p>Deliberately outside the signature, matching Stripe and GitHub, whose event and delivery
+     * ids also ride in unsigned headers. The duplicates this system genuinely produces come from our
+     * own retries and reclaims rather than from an attacker, and those are all fixed by this. The
+     * residual: someone who can modify a request in flight could alter the id to force reprocessing
+     * — they cannot touch the body, and the five-minute freshness window bounds them. Folding the id
+     * into the signed string would close that too, at the cost of changing a scheme that is already
+     * published and verified.
+     */
+    public static final String EVENT_ID_HEADER = "X-Webhook-Event-Id";
+
     private final WebClient webClient;
     private final Duration hardTimeout;
+    private final String hmacSecret;
 
     /**
      * @param builder     Spring Boot auto-configures a {@code WebClient.Builder} bean, pre-wired
@@ -40,9 +62,30 @@ public class WebhookSender {
      *                    is inherited — including the Micrometer instrumentation that Week 6's
      *                    Prometheus metrics depend on.
      * @param hardTimeout the ceiling on a single delivery attempt, from configuration.
+     * @param hmacSecret  the shared signing secret, from the environment with no default.
      */
     public WebhookSender(WebClient.Builder builder,
-                         @Value("${webhook.http.timeout:10s}") Duration hardTimeout) {
+                         @Value("${webhook.http.timeout:10s}") Duration hardTimeout,
+                         @Value("${webhook.hmac.secret}") String hmacSecret) {
+
+        // FAIL AT STARTUP, NOT ON THE FIRST CUSTOMER EVENT.
+        //
+        // The property has no default, so a MISSING variable already fails context startup before
+        // this line runs. This catches the other half: a variable that is SET AND EMPTY resolves to
+        // "" and sails through. Both cases have to die here, because the alternative is a worker
+        // that boots clean, passes every health check, and delivers webhooks that cannot be
+        // verified by anybody — with nothing in any log saying so.
+        //
+        // Throwing from a constructor fails the Spring context, which exits the process with a
+        // non-zero code. Same posture as the Redis password (8a) and the datasource credentials
+        // (10a): a missing secret is a refusal to run, not a degraded mode.
+        if (hmacSecret == null || hmacSecret.isBlank()) {
+            throw new IllegalStateException(
+                    "webhook.hmac.secret is missing or blank — refusing to start, because an "
+                            + "unsigned webhook is indistinguishable from a forged one. "
+                            + "Set HMAC_SECRET (generate with: openssl rand -hex 32).");
+        }
+        this.hmacSecret = hmacSecret;
         // ONE WebClient, built once and reused for every delivery. This is not a micro-optimisation:
         // a WebClient owns a connection pool, so reusing it lets repeated deliveries to the same
         // subscriber reuse an established TCP connection and skip the TLS handshake — the single
@@ -58,10 +101,38 @@ public class WebhookSender {
     public DeliveryResult send(DeliveryJob job) {
         long startNanos = System.nanoTime();
 
+        // 🔴 THE CLOCK IS READ HERE, PER ATTEMPT — NOT WHEN THE JOB WAS ENQUEUED.
+        //
+        // Signing once at enqueue time and storing the result would compute one HMAC instead of one
+        // per attempt, and it would break retries silently. The subscriber rejects anything older
+        // than five minutes, and a job can easily be delivered long after it was created: the
+        // backoff schedule alone spans 31 seconds (12b), a recovery sweep adds at least 60 more
+        // (14b), and a subscriber outage can stack both. A delivery carrying a six-minute-old
+        // timestamp is refused for being LATE rather than wrong — and since 12a classifies a 401 as
+        // permanent, the event would go straight to the dead-letter queue with a log line blaming
+        // the subscriber.
+        //
+        // So: fresh timestamp, fresh signature, every attempt. The cost is an HMAC per delivery,
+        // which is microseconds against a network call that takes milliseconds at best.
+        long timestampSeconds = Instant.now().getEpochSecond();
+        String signature = HmacSigner.headerValue(timestampSeconds, job.payload(), hmacSecret);
+
         try {
             Integer status = webClient.post()
                     .uri(job.subscriberUrl())
                     .contentType(MediaType.APPLICATION_JSON)
+
+                    // Proves this delivery came from us, unaltered, and recently (15a).
+                    .header(HmacSigner.SIGNATURE_HEADER, signature)
+
+                    // Lets the subscriber discard a duplicate. See EVENT_ID_HEADER above.
+                    .header(EVENT_ID_HEADER, job.eventId())
+
+                    // THE BODY IS UNCHANGED — the same String that came off the queue, which is the
+                    // same String that was just signed. Not a copy, not a re-serialization. If this
+                    // ever became `objectMapper.writeValueAsString(...)` of a parsed payload, the
+                    // bytes could differ from the signed ones by a space or a key order and every
+                    // subscriber would reject every delivery (15a).
                     .bodyValue(job.payload())
 
                     // exchangeToMono gives raw access to the response and, critically, applies NO
