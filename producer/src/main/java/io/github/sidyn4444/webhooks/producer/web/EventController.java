@@ -2,6 +2,7 @@ package io.github.sidyn4444.webhooks.producer.web;
 
 import io.github.sidyn4444.webhooks.common.model.Event;
 import io.github.sidyn4444.webhooks.producer.queue.QueueService;
+import io.github.sidyn4444.webhooks.producer.security.UrlSafety;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -63,6 +64,25 @@ public class EventController {
      */
     @PostMapping("/events")
     public ResponseEntity<EventResponse> receive(@Valid @RequestBody Event event) {
+
+        // The SSRF gate (notes 3b, 16a). This is written as a visible statement rather than as
+        // another annotation on Event, and that is deliberate: every other rule on that record is
+        // instant and offline, while this one performs a DNS lookup over the network. A check that
+        // makes a network call should look like it makes a network call — hiding it behind a label
+        // on a model in `common` would mean any code, anywhere, that validates an Event silently
+        // resolves a hostname.
+        //
+        // Ordering is free and correct: @Valid runs before this method is entered, so the cheap
+        // shape checks have already rejected junk. Nothing reaches the resolver unless it is at
+        // least a well-formed request.
+        UrlSafety.Result urlCheck = UrlSafety.check(event.subscriberUrl());
+        if (!urlCheck.isSafe()) {
+            // Thrown, not returned. GlobalExceptionHandler owns what an error looks like for the
+            // whole service, and it is also the single place that decides which half of this goes
+            // to the log and which half goes to the caller.
+            throw new UnsafeUrlException(event.eventId(), urlCheck.verdict(), urlCheck.detail());
+        }
+
         queueService.enqueue(event);
         return ResponseEntity
                 .status(HttpStatus.ACCEPTED)

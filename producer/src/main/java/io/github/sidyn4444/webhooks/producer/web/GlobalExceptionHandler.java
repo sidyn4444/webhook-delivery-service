@@ -91,6 +91,48 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
     }
 
     /**
+     * A subscriber URL that failed the SSRF check (notes 3b, 16a). The event is refused with a
+     * 400 and never reaches the queue.
+     *
+     * <p><b>This method is the whole two-audience split, in four lines.</b> The rejection carries
+     * two explanations at two levels of detail, and exactly one of them is allowed to leave the
+     * building:
+     *
+     * <ul>
+     *   <li>{@code detail} — "host localtest.me resolves to blocked address 127.0.0.1" — goes to
+     *       <b>our log only</b>. It names the address that was resolved, which is the one fact
+     *       that cannot be recovered afterwards: re-resolving the name tomorrow asks the
+     *       attacker's own DNS server what it feels like saying then, and a one-second TTL is a
+     *       configuration setting. For a security control the log is evidence.
+     *   <li>{@code verdict.publicMessage()} — "subscriber_url is not an allowed destination" —
+     *       goes to <b>the caller</b>, and says nothing else. A specific message would turn this
+     *       400 into a network scanner: submit addresses one at a time, read the replies, and map
+     *       an internal network you cannot reach by making <i>us</i> describe it.
+     * </ul>
+     *
+     * <p>It is the same split as {@link #handleUnexpected}, applied to a different secret. There
+     * the caller is denied a stack trace; here they are denied an address.
+     *
+     * <p>{@code WARN} rather than {@code ERROR}: nothing is broken, and a blocked URL is a
+     * <i>refusal working correctly</i>. But it is not {@code INFO} either — someone aiming an
+     * event at an internal address is worth noticing, and a burst of these is a probe rather than
+     * a typo. Logged with the event id so it is traceable; never with the payload.
+     *
+     * <p>The response deliberately reuses {@link ApiError#validation} with a
+     * {@code subscriber_url} key, so this is indistinguishable in shape from any other rule that
+     * field can fail. A caller writes one piece of error-handling code, not two.
+     */
+    @ExceptionHandler(UnsafeUrlException.class)
+    public ResponseEntity<ApiError> handleUnsafeUrl(UnsafeUrlException ex) {
+        log.warn("Rejected event {} — unsafe subscriber_url: {}", ex.eventId(), ex.detail());
+
+        return new ResponseEntity<>(
+                ApiError.validation("Validation failed",
+                        Map.of("subscriber_url", ex.verdict().publicMessage())),
+                HttpStatus.BAD_REQUEST);
+    }
+
+    /**
      * The catch-all: anything not handled above is an unanticipated fault — a bug, a downstream
      * outage, something we did not foresee.
      *
