@@ -1,44 +1,50 @@
 # Distributed Webhook Delivery Service
 
-A backend service in Java/Spring Boot that reliably delivers HTTP webhooks to subscriber
-URLs across a pool of stateless workers — with exponential-backoff retries, a dead-letter
-queue for permanent failures, HMAC-SHA256 request signing, and SSRF-hardened URL validation.
-Kubernetes orchestration on AWS EKS and Prometheus/Grafana observability are the remaining
-phases.
+**Reliable at-least-once HTTP webhook delivery** — exponential-backoff retries with jitter, a dead-letter queue for permanent failures, HMAC-SHA256 request signing, and SSRF-hardened ingest.
 
-> **Status: Week 3 of 6 — the delivery engine is feature-complete and running locally.**
->
-> **Built and verified by execution:**
-> `POST /events` validates, refuses unsafe URLs, enqueues to Redis and returns `202` · workers
-> pull jobs with a reliable-queue pattern and acknowledge only on a confirmed 2xx · failures are
-> classified and retried with **exponential backoff plus jitter** from a Redis sorted set ·
-> permanently-failed and retry-exhausted jobs are **dead-lettered** with a reason · **multiple
-> workers share the queue**, and a job held by a worker killed mid-delivery is reclaimed by a
-> sibling via an atomic Lua script · every outbound POST is **HMAC-SHA256 signed per attempt**
-> and carries a stable event id for receiver-side deduplication · every subscriber URL is judged
-> by **the IP it resolves to**, not the hostname it wears · every attempt is a durable row in
-> Postgres.
->
-> **Not built yet:** Dockerfiles and Kubernetes manifests (Week 4), the AWS EKS deployment
-> (Week 5), and Prometheus/Grafana dashboards plus load-test benchmarks (Week 6). The JUnit 5 +
-> Mockito suite is in progress. See [Roadmap](#roadmap).
+![Java](https://img.shields.io/badge/Java-21-orange)
+![Spring Boot](https://img.shields.io/badge/Spring%20Boot-3.3-brightgreen)
+![Redis](https://img.shields.io/badge/Redis-7-red)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-blue)
+![Docker](https://img.shields.io/badge/Docker-Compose-2496ED)
+
+> A self-directed project built to work through distributed-systems fundamentals — delivery
+> semantics, reliable queueing, failure classification, and idempotency — as production code
+> rather than as reading. **The delivery engine is complete and running locally.**
+> Containerization and an AWS EKS deployment are in progress.
 
 ---
 
 ## The problem
 
-When something happens in your system — a payment succeeds, a build finishes, a file
-uploads — other systems need to know. The alternative to webhooks is *polling*: every
-interested party asking "has anything happened yet?" every few seconds, forever. That
-wastes work on both sides and still adds latency.
+When something happens in your system — a payment succeeds, a build finishes — other systems
+need to know. The alternative is *polling*: every interested party asking "anything yet?" every
+few seconds, forever.
 
-Webhooks invert it: you call *them* when the event occurs. But that hands you a hard
-problem, because you are now making an HTTP request to a server **you do not control**.
-It can be slow, down, rate-limiting, or quietly broken. Delivery has to survive all of
-that without losing events and without hammering a struggling server.
+Webhooks invert it: you call *them*. But that hands you a hard problem, because you are now
+making an HTTP request to a server **you do not control**. It can be slow, down, rate-limiting,
+or quietly broken — and delivery has to survive all of it without losing events and without
+hammering a struggling server.
 
-That is the problem this service solves, and it's the same one Stripe, GitHub, Twilio,
-and Slack each solve internally.
+That's the problem this service solves, and it's the same one Stripe, GitHub, Twilio and Slack
+each solve internally.
+
+## What works today
+
+| Capability | Status |
+|---|---|
+| `POST /events` → validated → queued → `202 Accepted` | ✅ |
+| Reliable queue — atomic hand-off, acknowledge only on a confirmed 2xx | ✅ |
+| Failure classification → retry vs. dead-letter | ✅ |
+| Exponential backoff **with jitter**, scheduled in a Redis sorted set | ✅ |
+| Dead-letter queue with a typed reason per entry | ✅ |
+| Multiple workers sharing one queue + recovery sweep for crashed workers | ✅ |
+| HMAC-SHA256 signing, per attempt, with a stable event id for deduplication | ✅ |
+| SSRF validation — every URL judged by the **IP it resolves to** | ✅ |
+| Durable delivery-attempt log in PostgreSQL (metadata only, never payloads) | ✅ |
+| JUnit 5 + Mockito suite with JaCoCo coverage | 🚧 in progress |
+| Docker images + Kubernetes manifests | ○ next |
+| AWS EKS deployment, Prometheus + Grafana dashboards | ○ planned |
 
 ## Architecture
 
@@ -69,148 +75,98 @@ and Slack each solve internally.
               └──────────────┘
 ```
 
-**The delivery cycle.** A worker atomically moves a job from `queue` to `processing` and
-records the pickup time in `inflight`. On a confirmed 2xx it writes the attempt row *first*,
-then acknowledges. On a retryable failure it schedules the job in `retry` with a jittered
-due-time; on a permanent one — or once the retry budget is spent — it goes to `dlq` with a
-reason. A separate sweep thread looks for jobs whose pickup time is older than the hard
-delivery timeout allows, and re-queues them, which is what makes a worker dying mid-delivery
-survivable.
+**The delivery cycle.** A worker atomically moves a job from `queue` to `processing` and records
+the pickup time in `inflight`. On a confirmed 2xx it writes the attempt row *first*, then
+acknowledges. On a retryable failure it schedules the job in `retry` with a jittered due-time; on
+a permanent one — or once the retry budget is spent — it goes to `dlq` with a reason. A separate
+sweep thread finds jobs whose pickup time is older than the hard delivery timeout allows and
+re-queues them, which is what makes a worker dying mid-delivery survivable.
 
-**Producer and worker are separate deployables** so they scale independently: the producer
-scales with inbound traffic, the workers with delivery backlog. Redis is the only thing
-they share, which is what decouples them — a slow subscriber can never slow down event
-ingestion.
+**Producer and worker are separate deployables** so they scale independently — the producer with
+inbound traffic, the workers with delivery backlog. Redis is the only thing they share, which is
+what stops a slow subscriber from ever slowing down event ingestion.
 
-### Key design decisions
+## Design decisions
 
 | Decision | Why |
 |---|---|
-| **At-least-once delivery, not exactly-once** | Exactly-once is impossible over an unreliable network (the Two Generals problem). Every event carries a stable `event_id` as an idempotency key, so duplicates are recognized and discarded — the same approach Stripe and GitHub use. |
-| **`RPOPLPUSH` + ack, not `BLPOP`** | `BLPOP` deletes the job the instant it hands it out; if the worker dies mid-delivery the event is gone forever. `RPOPLPUSH` *moves* it to a processing list, so a crashed worker leaves a trace and a recovery sweep re-queues it. |
-| **Exponential backoff with jitter** | 1s → 2s → 4s → 8s → 16s. Fast recovery from brief blips, hard back-off from real outages, and randomized so a thousand simultaneous failures don't retry in synchronized waves against a recovering server. |
-| **4xx → immediate DLQ; 5xx/429/timeout → retry** | A 4xx means the request itself is wrong; retrying it is deterministically useless. Only transient failures are worth retrying. |
-| **Three Maven modules, not two** | The producer serializes `DeliveryJob` into Redis and the worker deserializes it out — that's a wire contract between two processes. A shared `common` module makes a schema change a compile error at build time instead of a deserialization failure in production. |
-| **Delivery log stores metadata, never payloads** | Payloads may contain PII. The queue needs them transiently; a permanent, queryable audit log does not. Data minimization. |
-| **Secrets from AWS Secrets Manager via IRSA** *(decided, Week 5 — not yet built)* | Pods assume an IAM role through a Kubernetes service account — no long-lived AWS credentials in code, images, or manifests. Chosen over Kubernetes Secrets for encryption at rest, rotation and audit — and because the secret fetch is the only AWS API call in the system, so Kubernetes Secrets would leave IRSA with no job to do. |
+| **At-least-once, not exactly-once** | Exactly-once is impossible over an unreliable network. Every event carries a stable `event_id` as an idempotency key so duplicates are recognized and discarded — the approach Stripe and GitHub use. |
+| **`RPOPLPUSH` + explicit ack, not `BLPOP`** | `BLPOP` deletes the job the instant it hands it out; a worker dying mid-delivery loses an event that was already accepted. `RPOPLPUSH` *moves* it, so the job is never in zero places. |
+| **Retries wait in Redis, not in the worker** | `Thread.sleep` blocks one of a small number of workers for up to 16s **and** the delay lives only in process memory, so a restart loses it. A sorted set scored by due-time survives both. |
+| **Backoff is jittered** | 1s → 2s → 4s → 8s → 16s, randomized. Without jitter, a thousand deliveries that failed together retry together and take down a server that was recovering. |
+| **Sign at send time, never at enqueue** | A signature made at enqueue is minutes old by the time a retried delivery goes out, so the receiver rejects it as stale — and the happy path passes under both designs, which is what makes it easy to get wrong. |
+| **Judge the resolved IP, never the hostname** | The attacker registers the hostname. `localtest.me` is a real public domain that resolves to `127.0.0.1`, so a string blocklist catches only honest typos. |
+| **Three Maven modules, not two** | The producer serializes a job into Redis and the worker deserializes it — a wire contract between two processes. A shared module makes a schema change a compile error instead of a runtime deserialization failure. |
+| **The delivery log stores no payloads** | Payloads may contain PII. The queue needs them transiently; a permanent, queryable, backed-up audit log does not. A column that doesn't exist cannot be written to by a future code path. |
 
 ## Reliability, demonstrated
 
-Every claim above was verified by running the failure, not by reasoning about it. The runs
-that matter:
+Every claim above was verified by *running* the failure, not by reasoning about it.
 
-- **A worker `kill -9`'d mid-delivery loses nothing.** Three real worker processes, nine
-  events against a deliberately slow endpoint so the work actually overlapped — mid-flight
-  state `queue=6 processing=3 inflight=3`, work split 3/3/3 across disjoint sets. One worker
-  was killed with `SIGKILL` while holding a job; the job and its pickup timestamp survived in
-  Redis, the two survivors delivered every subsequent event without a gap, and ~60s later a
-  sibling reclaimed and completed the orphan. **`RECLAIMED` appears exactly once across all
-  three logs** — two workers swept the same job every 10 seconds for a minute and only one
-  claimed it, which is what the Lua script exists to guarantee.
+- **A worker `kill -9`'d mid-delivery loses nothing.** Three real worker processes, nine events
+  against a deliberately slow endpoint so the work actually overlapped — mid-flight state
+  `queue=6 processing=3 inflight=3`, split 3/3/3 across disjoint sets. One worker was killed with
+  `SIGKILL` while holding a job; the job and its pickup timestamp survived, the survivors kept
+  delivering without a gap, and ~60s later a sibling reclaimed and completed the orphan.
+  **`RECLAIMED` appears exactly once across all three logs** — two workers swept the same job
+  every 10 seconds for a minute and only one claimed it, which is what the Lua script guarantees.
 - **A subscriber that accepts the connection and never answers is cut off at 10 seconds** —
-  measured at 10,011 ms — rather than pinning a worker indefinitely.
-- **The signature is verified by a different implementation.** A ~100-line Python subscriber
-  written from the published spec, importing none of the Java, computes a **byte-identical**
-  signature. On the retry path the same event produces **three distinct timestamps and three
-  distinct signatures but one event id** — the pair that must disagree, disagreeing.
-- **The SSRF guard was disabled on purpose to prove it is what blocks.** With the check
-  removed, `http://169.254.169.254/latest/meta-data/` returned `202` and landed on the queue
-  as a real job with a retry budget. Restored, the same URL returns `400` **and the queue
-  length does not move** — the status code is not the proof; the absent side effect is.
-  Blocked inputs include `localtest.me` and `*.nip.io`, genuine public domains that resolve
-  to `127.0.0.1` and `10.0.0.5` and defeat any hostname-based blocklist.
-- **Payloads never appear in our logs or in the delivery-log table** — asserted by counting a
-  unique marker in both, with a line-count sanity check so a zero can't come from an empty file.
+  measured at 10,011 ms — instead of pinning a worker indefinitely.
+- **The signature is verified by a second implementation.** A ~100-line Python subscriber written
+  from the published spec, importing none of the Java, computes a **byte-identical** signature. On
+  the retry path the same event produces three distinct timestamps and three distinct signatures
+  but one event id — the pair that must disagree, disagreeing.
+- **The SSRF guard was disabled on purpose to prove it is what blocks.** With the check removed,
+  `http://169.254.169.254/latest/meta-data/` returned `202` and landed on the queue as a real job
+  with a retry budget. Restored, the same URL returns `400` **and the queue length does not
+  move** — the status code isn't the proof; the absent side effect is.
+- **Payloads never appear in application logs or in the delivery-attempt table**, asserted by
+  counting a unique marker in both, with a line-count sanity check so a zero can't come from an
+  empty file.
 
 ## Security
 
-- **HMAC-SHA256 signing** on every outbound webhook (`X-Webhook-Signature`), verified by the
-  subscriber against a shared secret — proves authenticity and integrity.
-- **SSRF prevention** on subscriber URLs: DNS is resolved *first* and the resulting **IP** is
-  checked against blocked ranges (loopback, RFC-1918 private, link-local incl. the
-  `169.254.169.254` cloud metadata endpoint, IPv6 local). Judging the hostname string
-  instead of the resolved address is the mistake that made SSRF a top-10 vulnerability.
-- **Hard 10s timeout** on every outbound call, so one unresponsive subscriber cannot occupy a
-  worker indefinitely.
-- **No secrets in git**: `.env` is gitignored, `.env.example` is committed with dummy values,
-  and configuration reads `${ENV_VAR}` placeholders with **no defaults**, so a missing secret
-  fails startup instead of silently running unauthenticated.
-- **Planned for Week 5** (not yet built): narrow IAM roles for pods via IRSA; ElastiCache and
-  RDS in private subnets with security groups admitting only the EKS node group.
+- **HMAC-SHA256 signing** on every outbound webhook (`X-Webhook-Signature: t=…,v1=…`), computed
+  over `timestamp.payload` so a captured request can't be replayed indefinitely.
+- **SSRF prevention** — DNS is resolved *first* and every resulting IP is checked against loopback,
+  RFC-1918 private, CGNAT, link-local (including the `169.254.169.254` cloud-metadata endpoint),
+  IPv6 unique-local and multicast ranges.
+- **Hard 10s timeout** on every outbound call, covering DNS, connect, TLS and response.
+- **No secrets in git** — `.env` is gitignored, `.env.example` ships dummy values, and config reads
+  `${ENV_VAR}` placeholders with **no defaults**, so a missing secret fails startup rather than
+  silently running unauthenticated.
 
-### Known limitations, stated deliberately
+**Known gaps, named deliberately** — security work is only credible if the holes are stated too:
 
-Security work is only credible if the gaps are named too:
-
-- **DNS rebinding is not defended.** The URL is validated at the front door and re-resolved by
-  the worker at delivery time — two moments, and only the first is checked. Pinning the
-  validated IP through to the connection is the fix; it is out of scope.
-- **Producer-side deduplication is not implemented.** Every event carries a stable `event_id`
-  and the outbound request sends it, but the producer does not currently reject a repeated id,
-  so 100% of the deduplication burden sits on the receiver.
-- **Rejections are logged, not audited.** There is no durable record of blocked URLs, because
-  the producer has no database dependency.
-- **No rate limiting yet.** A caller can probe the URL validator indefinitely at one `400` each.
-
-## Tech stack
-
-**In use today** — Java 21 · Spring Boot 3.3 · Maven (multi-module) · Spring WebClient ·
-Spring Data Redis (Lettuce) · Redis 7 incl. sorted sets and Lua scripting · Spring Data JPA +
-Hibernate · PostgreSQL 16 · Flyway · JUnit 5 + Mockito + JaCoCo · Docker Compose
-
-**Planned** — Docker (multi-stage, distroless) · Kubernetes 1.30 · Helm 3 · AWS EKS,
-ElastiCache, RDS, ALB Ingress, ACM, Secrets Manager · Micrometer · Prometheus · Grafana
-
-## Repository layout
-
-```
-producer/     Spring Boot service — receives events, validates, enqueues
-worker/       Spring Boot daemon  — pulls jobs, delivers, retries, dead-letters
-common/       Shared library      — models, Redis key constants, HMAC utilities
-docker/       Dockerfiles (multi-stage, distroless)          [Week 4]
-k8s/local/    Manifests for minikube                          [Week 4]
-k8s/eks/      Manifests for the AWS cluster                   [Week 5]
-deploy/       eksctl scripts, cluster bootstrapping           [Week 5]
-monitoring/   Prometheus + Grafana Helm values, dashboards    [Week 6]
-scripts/      Load-testing and chaos-testing                  [Week 6]
-```
+- **DNS rebinding is undefended.** The URL is checked at ingest and re-resolved by the worker at
+  delivery time; only the first moment is guarded. Pinning the validated IP is the fix.
+- **Deduplication is receiver-side only.** Events carry a stable id and it's sent on the wire, but
+  the producer doesn't yet reject a repeated one.
+- **No rate limiting**, so a caller can probe the URL validator indefinitely at one `400` each.
 
 ## Running it locally
 
 **Prerequisites:** Java 21, Maven 3.9+, Docker.
 
 ```bash
-# 1. Configure the environment
-cp .env.example .env          # then edit .env with real local values
+cp .env.example .env          # then fill in local values
+docker compose up -d          # Redis + Postgres, both password-protected
+mvn clean install             # builds all three modules
 
-# 2. Start the backing services (Redis + Postgres, both password-protected)
-docker compose up -d
-docker compose ps             # both should report (healthy)
-
-# 3. Build every module
-mvn clean install
-
-# 4. Run the producer — serves HTTP on :8080
-java -jar producer/target/producer-0.0.1-SNAPSHOT.jar
-
-# 5. Run the worker — a daemon, no web server
-java -jar worker/target/worker-0.0.1-SNAPSHOT.jar
+java -jar producer/target/producer-0.0.1-SNAPSHOT.jar   # HTTP on :8080
+java -jar worker/target/worker-0.0.1-SNAPSHOT.jar       # daemon, no web server
 ```
-
-Verify the producer is up:
 
 ```bash
 curl localhost:8080/actuator/health
 # {"status":"UP","groups":["liveness","readiness"]}
 ```
 
-Those two groups are not decoration — `/actuator/health/liveness` and
-`/actuator/health/readiness` are the exact endpoints Kubernetes probes call to decide
-whether to restart a pod or stop routing traffic to it.
+Those two groups aren't decoration — `/actuator/health/liveness` and `/actuator/health/readiness`
+are the exact endpoints Kubernetes probes call to decide whether to restart a pod or stop routing
+traffic to it.
 
-### Sending an event end to end
-
-With both processes running, deliver a webhook to any URL that accepts a POST:
+### Sending an event
 
 ```bash
 curl -X POST localhost:8080/events \
@@ -223,28 +179,19 @@ curl -X POST localhost:8080/events \
 # HTTP 202 — accepted, not yet delivered
 ```
 
-The `202` is deliberate: the event has been *queued*, not delivered. Returning `200` would
-claim it reached the subscriber, and a caller who believes that will never retry.
+The `202` is deliberate: the event has been *queued*, not delivered. Returning `200` would claim
+it reached the subscriber, and a caller who believes that will never retry.
 
-> ⚠️ **A local test subscriber on `localhost` will be refused with a `400`, and that is correct
-> behaviour.** `localhost` resolves to `127.0.0.1`, and the SSRF check cannot distinguish a
-> harmless test server from an attacker's internal target — there is no difference visible from
-> the address. Use a public endpoint (webhook.site, or any host you control) when trying this
-> out. A dev-profile allowlist would solve it and is deliberately not implemented: a bypass
-> switch is exactly the thing that reaches production still enabled.
+> ⚠️ **A test subscriber on `localhost` will be refused with a `400`, and that's correct.**
+> `localhost` is `127.0.0.1`, and the SSRF check cannot distinguish a harmless test server from an
+> attacker's internal target — there is no difference visible from the address. Use a public
+> endpoint when trying this out. A dev-profile allowlist would solve it and is deliberately not
+> implemented: a bypass switch is exactly the thing that reaches production still enabled.
 
-Watch it move through the system:
+### The delivery log
 
-```bash
-# in flight — the job is atomically moved, never deleted, so a crash can't lose it
-docker exec webhook-redis redis-cli -a "$REDIS_PASSWORD" --no-auth-warning \
-  LLEN webhooks:queue
-
-# the durable record — one row per attempt, success or failure
-docker exec -e PGPASSWORD="$POSTGRES_PASSWORD" webhook-postgres \
-  psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
-  -c "SELECT event_id, attempt_number, status_code, success, duration_ms
-      FROM delivery_attempts ORDER BY id DESC LIMIT 5;"
+```sql
+SELECT event_id, attempt_number, status_code, success, duration_ms FROM delivery_attempts;
 ```
 
 ```
@@ -254,26 +201,28 @@ docker exec -e PGPASSWORD="$POSTGRES_PASSWORD" webhook-postgres \
  1111000a-0000-0000-0000-0000000001 |              1 |             | f       |       10024
 ```
 
-**`status_code` is nullable on purpose.** The second row is a timeout — no response ever
-arrived, so there is no status code. Writing `500` there would claim the subscriber's server
-reported a failure, when in fact it may have succeeded and simply answered too late. Those
-are different problems with different owners, and only `NULL` says which one happened.
+**`status_code` is nullable on purpose.** The second row is a timeout — no response ever arrived,
+so there is no status code. Writing `500` there would claim the subscriber reported a failure,
+when it may have succeeded and simply answered too late. Different problems, different owners, and
+only `NULL` says which happened.
 
-**Tearing down:** `docker compose down` stops the containers and keeps the data volumes.
-Add `-v` to delete the data as well.
+## Tech stack
+
+**In use** — Java 21 · Spring Boot 3.3 · Maven (multi-module) · Spring WebClient · Spring Data
+Redis (Lettuce) · Redis 7 incl. sorted sets and Lua scripting · Spring Data JPA / Hibernate ·
+PostgreSQL 16 · Flyway · JUnit 5 · Mockito · JaCoCo · Docker Compose
+
+**Planned** — Docker (multi-stage, distroless, non-root) · Kubernetes · Helm · AWS EKS,
+ElastiCache, RDS, ALB Ingress, ACM, Secrets Manager · Micrometer · Prometheus · Grafana
 
 ## Roadmap
 
-| Week | Scope | Status |
+| Phase | Scope | Status |
 |---|---|---|
-| 1 | Distributed-systems fundamentals · system design · security architecture · dev environment · multi-module Maven skeleton | ✅ **Complete** |
-| 2 | `POST /events` producer · worker pulling from Redis · delivery log via JPA · end-to-end locally | ✅ **Complete** |
-| 3 | Multiple workers · exponential-backoff retry · DLQ · HMAC signing · SSRF validation · JUnit/Mockito suite (80% target) | 🚧 **In progress** — retry, DLQ, recovery sweep, HMAC and SSRF all complete; the test suite is underway |
-| 4 | Dockerfiles (multi-stage, distroless, non-root) · Kubernetes manifests · local deploy to minikube | Planned |
-| 5 | AWS EKS via eksctl · ElastiCache + RDS in private subnets · ALB Ingress · HTTPS via ACM · IRSA | Planned |
-| 6 | Prometheus + Grafana via Helm · dashboards · load testing · documented chaos test · benchmarks | Planned |
-
----
-
-*Built as a self-directed project to work through distributed-systems fundamentals,
-container orchestration, and cloud deployment end to end.*
+| Foundations | System design, data model, failure modes, security architecture | ✅ Complete |
+| Core pipeline | `POST /events` → Redis → worker → HTTP delivery → PostgreSQL log | ✅ Complete |
+| Resilience & security | Retry with jitter · DLQ · multi-worker recovery sweep · HMAC signing · SSRF validation | ✅ Complete |
+| Test suite | JUnit 5 + Mockito across all three modules, JaCoCo-tracked | 🚧 In progress |
+| Containerization | Multi-stage distroless images · Kubernetes manifests · local cluster deploy | ○ Next |
+| Cloud deployment | AWS EKS · ElastiCache + RDS in private subnets · ALB Ingress · HTTPS · IRSA | ○ Planned |
+| Observability | Prometheus + Grafana dashboards · load testing · documented chaos test | ○ Planned |
