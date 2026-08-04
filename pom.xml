@@ -56,6 +56,13 @@
         <java.version>21</java.version>
         <maven.compiler.release>21</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+
+        <!-- Pinned by hand ON PURPOSE. Spring Boot's parent manages versions for
+             every plugin it knows about (surefire, compiler, the boot plugin) —
+             confirmed by grepping the effective POM, where "jacoco" appears 0 times.
+             JaCoCo is not one of them, so leaving the version off would resolve
+             to whatever Maven felt like that day and could change between machines. -->
+        <jacoco.version>0.8.12</jacoco.version>
     </properties>
 
     <!-- ============================================================
@@ -85,5 +92,59 @@
             <scope>test</scope> <!-- test scope = compiled for tests, never shipped in the JAR -->
         </dependency>
     </dependencies>
+
+    <!-- ============================================================
+         BUILD: plugins are NOT dependencies. A dependency is code our
+         program uses at runtime; a plugin is code MAVEN runs while
+         building. Declared here in the root, every module inherits it,
+         so coverage is measured project-wide from one place.
+         ============================================================ -->
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.jacoco</groupId>
+                <artifactId>jacoco-maven-plugin</artifactId>
+                <version>${jacoco.version}</version>
+                <executions>
+
+                    <!-- 1. Attach the recorder BEFORE the tests run.
+                         This does not run tests. It builds a -javaagent:... flag
+                         and writes it into the 'argLine' property, which Surefire
+                         then passes to the test JVM. The agent rewrites each class
+                         as it loads so every line reports whether it executed.
+                         ⚠️ If anything ever hard-codes <argLine> in Surefire config,
+                         it overwrites this and every report silently reads 0%. -->
+                    <execution>
+                        <id>jacoco-prepare-agent</id>
+                        <goals>
+                            <goal>prepare-agent</goal>
+                        </goals>
+                    </execution>
+
+                    <!-- 2. Turn the raw recording (target/jacoco.exec) into readable
+                         reports: HTML to browse, CSV/XML to measure from a script.
+                         Bound to 'test' rather than its default 'verify' so that a
+                         plain `mvn test` produces a report too — otherwise the report
+                         only appears on `mvn verify`/`install`, which looks exactly
+                         like the plugin not working. -->
+                    <execution>
+                        <id>jacoco-report</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>report</goal>
+                        </goals>
+                    </execution>
+
+                    <!-- 3. NOT PRESENT, DELIBERATELY: the 'check' goal.
+                         'check' fails the build when coverage drops below a
+                         threshold. Report-only was the decision (SESSION_CHECKLIST,
+                         design decision #4) — enforcing costs a red build on every
+                         regression. The price of not having it: a later coverage
+                         drop goes unannounced. -->
+
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
 
 </project>
