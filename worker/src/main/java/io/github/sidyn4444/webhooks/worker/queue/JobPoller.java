@@ -309,7 +309,18 @@ public class JobPoller implements SmartLifecycle {
      * <p>9d adds the ack — removing the job from {@code processing} once delivery succeeded.
      * Until then every job stays parked there regardless of outcome.
      */
-    private void handle(String json) {
+    /**
+     * Package-private rather than {@code private} so {@code JobPollerTest} can drive one job
+     * through the full decision tree directly, without starting the polling thread.
+     *
+     * <p>The alternative was to test through {@link #start()} with a stubbed Redis — rejected
+     * because the loop below catches every exception and then sleeps for {@code ERROR_BACKOFF},
+     * so a genuine failure would surface as a stalled test rather than a red one, and a real
+     * failure would be indistinguishable from a slow machine. The visibility is widened by one
+     * step, within the same package, to buy deterministic tests of the orderings this class
+     * exists to guarantee.
+     */
+    void handle(String json) {
         DeliveryJob job;
         try {
             job = JobCodec.fromJson(json);
