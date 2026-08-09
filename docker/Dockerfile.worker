@@ -1,0 +1,72 @@
+# =============================================================
+#  WORKER image — multi-stage build.
+#
+#  Structurally identical to docker/Dockerfile.producer. Three things differ,
+#  and nothing else:
+#    1. the module built            -pl worker  instead of  -pl producer
+#    2. the jar copied out          worker-*.jar
+#    3. NO `EXPOSE`                 the worker has no HTTP port at all
+#                                   (spring.main.web-application-type=none, 5f).
+#                                   19d gives it a management-only port; the
+#                                   EXPOSE line arrives with it, not before.
+#
+#  Build from the REPO ROOT:
+#      docker build -f docker/Dockerfile.worker -t webhook-worker:0.1.0 .
+#
+#  ⚠️ This container needs MORE configuration than the producer: Redis, Postgres
+#  AND the HMAC secret. It refuses to start without them — deliberately, and
+#  unlike the producer, which starts happily with none (19b).
+# =============================================================
+
+
+# -------------------------------------------------------------
+#  STAGE 1 — build the JAR
+# -------------------------------------------------------------
+FROM maven:3.9-eclipse-temurin-21 AS build
+
+WORKDIR /build
+
+#  POMs first: this layer depends only on them, so it survives every source
+#  change. All FOUR, including the producer's — the root POM declares it as a
+#  module and Maven cannot read the project with a declared module missing:
+#      [ERROR] Child module /build/producer of /build/pom.xml does not exist
+#  (measured while testing this exact ordering).
+COPY pom.xml .
+COPY common/pom.xml common/
+COPY producer/pom.xml producer/
+COPY worker/pom.xml worker/
+
+RUN mvn -B -pl worker -am dependency:go-offline
+
+#  THEN the source, and only the modules actually being built. producer/src is
+#  deliberately absent: a producer code change must not invalidate this image.
+COPY common/src common/src
+COPY worker/src worker/src
+
+RUN mvn -B -pl worker -am package -DskipTests
+
+
+# -------------------------------------------------------------
+#  STAGE 2 — the image that ships
+# -------------------------------------------------------------
+#  distroless: a Java runtime and essentially nothing else — no shell, no
+#  package manager, no compiler. `:nonroot` runs it as uid 65532 rather than
+#  root. Two separate controls arriving in one line (19b).
+FROM gcr.io/distroless/java21-debian12:nonroot
+
+WORKDIR /app
+
+#  The only thing that crosses from stage 1. Matches exactly one file: Spring
+#  Boot's repackage leaves the thin jar as `worker-*.jar.original`, which does
+#  not end in `.jar`.
+COPY --from=build /build/worker/target/worker-*.jar /app/app.jar
+
+#  19d: a port now genuinely exists, so this line is now true. It serves ONLY
+#  /actuator/health — no API, no metrics yet, nothing else. Documentation only:
+#  it publishes nothing, and a Kubernetes probe still has to name the port itself.
+EXPOSE 8081
+
+#  Absolute path to the binary; exec form, so no shell is involved (there isn't
+#  one). -XX:MaxRAMPercentage=75 because the JVM reads the container's memory
+#  limit but defaults to only ~25% of it as heap.
+ENTRYPOINT ["/usr/bin/java", "-XX:MaxRAMPercentage=75", "-jar", "/app/app.jar"]
