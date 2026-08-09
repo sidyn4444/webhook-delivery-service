@@ -1,0 +1,112 @@
+# =============================================================
+#  PRODUCER image — multi-stage build.
+#
+#  Stage 1 ("build") has Maven and a full JDK and produces the fat JAR.
+#  Stage 2 ("runtime") starts from an almost-empty base and copies ONLY that
+#  JAR across. Maven, the compiler and the source code never exist in the
+#  image that gets deployed.
+#
+#  Build from the REPO ROOT so the whole multi-module project is in context:
+#      docker build -f docker/Dockerfile.producer -t webhook-producer:0.1.0 .
+#
+#  For the amd64 EKS nodes in Week 5, the FILE does not change — only the
+#  command gains a flag:
+#      docker build --platform linux/amd64 -f docker/Dockerfile.producer ...
+# =============================================================
+
+
+# -------------------------------------------------------------
+#  STAGE 1 — build the JAR
+# -------------------------------------------------------------
+#  An official image that already contains Maven AND the JDK. Verified
+#  multi-architecture (linux/amd64 + linux/arm64/v8), so the same file works
+#  for local builds and for Week 5's cross-build.
+#  `AS build` names the stage so stage 2 can copy out of it by name.
+FROM maven:3.9-eclipse-temurin-21 AS build
+
+WORKDIR /build
+
+# --- POMs FIRST. This ordering is the whole caching strategy. ---------------
+#  Docker caches each instruction's result and reuses it while its inputs are
+#  unchanged — but a changed layer invalidates every layer AFTER it too.
+#
+#  So dependencies are downloaded in a layer that depends only on the POMs.
+#  Editing a .java file leaves that layer untouched and only recompiles;
+#  reverse these two blocks and every one-character code change re-downloads
+#  the entire dependency tree.
+#
+#  ⚠️ All FOUR POMs, including worker's. The root POM lists worker as a
+#  module, so the reactor cannot even be read if that file is missing —
+#  the build fails before it reaches anything to do with the producer.
+COPY pom.xml .
+COPY common/pom.xml common/
+COPY producer/pom.xml producer/
+COPY worker/pom.xml worker/
+
+#  Download everything the producer build needs, while only the POMs exist.
+#    -B   batch mode: no interactive prompts, no ANSI progress spam in logs
+#    -pl  "project list" — build only this module
+#    -am  "also make" — plus the modules it depends on (common)
+RUN mvn -B -pl producer -am dependency:go-offline
+
+# --- THEN the source ------------------------------------------------------
+#  Only the two modules being built. `worker/src` is deliberately absent: it
+#  is not needed, and copying it would make a worker code change invalidate
+#  the producer image's cache for no reason.
+COPY common/src common/src
+COPY producer/src producer/src
+
+#  Package the fat JAR.
+#    -DskipTests  the test suite runs in the build you already run; an image
+#                 build is packaging, and a JAR that fails its tests should
+#                 never have reached the packaging step. Honest cost: this
+#                 build validates nothing. In a team that gate is a CI stage.
+#    no `clean`   a fresh container has no previous build output to remove,
+#                 so `clean` here is a no-op that only costs time.
+RUN mvn -B -pl producer -am package -DskipTests
+
+
+# -------------------------------------------------------------
+#  STAGE 2 — the image that actually ships
+# -------------------------------------------------------------
+#  Everything above is now discarded. This stage starts from nothing but a
+#  Java runtime.
+#
+#  distroless = a Java runtime and essentially nothing else. No shell, no
+#  package manager, no curl, no ls. An attacker who gains execution here has
+#  no tools to pivot with, because they are not installed.
+#
+#  `:nonroot` runs the process as an unprivileged user (uid 65532) instead of
+#  root. ⚠️ These are TWO SEPARATE controls that happen to arrive together:
+#  distroless removes the tools, non-root means the ones that remain cannot
+#  touch anything protected. The plain tag would be distroless AS ROOT.
+#  Kubernetes enforces the same thing again at 21d via securityContext —
+#  defence at both layers, because an image setting can be overridden at run
+#  time and a cluster policy cannot.
+FROM gcr.io/distroless/java21-debian12:nonroot
+
+WORKDIR /app
+
+#  The ONLY thing that crosses from stage 1. A wildcard rather than the
+#  literal version, so bumping the project version doesn't break this file.
+#  ⚠️ It matches exactly one file: Spring Boot's repackage step leaves the
+#  pre-repackage JAR as `...jar.original`, which does not end in `.jar`.
+COPY --from=build /build/producer/target/producer-*.jar /app/app.jar
+
+#  DOCUMENTATION ONLY — this publishes nothing and opens nothing. It records
+#  the port the app listens on (server.port=8080) for humans and for tools
+#  that read image metadata. Reaching it still requires -p on docker run, or
+#  a Service in Kubernetes.
+EXPOSE 8080
+
+#  Absolute path to the java binary rather than bare `java`: there is no
+#  shell in this image to resolve PATH, so naming the binary outright removes
+#  a dependency on the base image's environment.
+#
+#  -XX:MaxRAMPercentage=75 — since Java 10 the JVM reads the CONTAINER's
+#  memory limit rather than the host's RAM, but it defaults to using only
+#  ~25% of it as heap. Under a 512Mi limit that is a 128Mi heap while the
+#  other 384Mi sits unused. 75% leaves headroom for metaspace, thread stacks
+#  and native memory, which are outside the heap and still count toward the
+#  limit that gets you OOMKilled.
+ENTRYPOINT ["/usr/bin/java", "-XX:MaxRAMPercentage=75", "-jar", "/app/app.jar"]
