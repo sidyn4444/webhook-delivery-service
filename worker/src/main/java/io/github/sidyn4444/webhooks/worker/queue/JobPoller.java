@@ -193,6 +193,31 @@ public class JobPoller implements SmartLifecycle {
         return running;
     }
 
+    /**
+     * Whether the poll thread is <b>actually alive</b>, as the JVM sees it.
+     *
+     * <p>🔴 <b>This is deliberately not {@link #isRunning()}, and the difference is the whole
+     * point.</b> {@code running} is a flag <i>we</i> set; {@code pollThread.isAlive()} is the
+     * JVM's own answer. They disagree in exactly the case worth detecting: if the poll thread
+     * dies from something {@code pollForever}'s catch block cannot handle — an
+     * {@code OutOfMemoryError}, a {@code StackOverflowError}, anything that is an
+     * {@link Error} rather than an {@link Exception} — then {@code running} is still
+     * {@code true} while the thread is gone.
+     *
+     * <p>That state is the worst failure this service has: a process that is up, holds healthy
+     * connections, reports itself running, and consumes nothing, forever. Nothing else in the
+     * system notices, because there is no request to fail and no exception left to log.
+     *
+     * <p>Asking the flag would report {@code UP} in precisely that situation, which is why the
+     * health indicator reads the thread instead. Unlike a dependency outage, this one <b>is</b>
+     * fixed by a restart — so it belongs in the liveness probe.
+     *
+     * @return true if the poll thread exists and has not terminated
+     */
+    public boolean isPollThreadAlive() {
+        return pollThread != null && pollThread.isAlive();
+    }
+
     public JobPoller(StringRedisTemplate redis, WebhookSender sender,
                      DeliveryAttemptRepository attempts, RetryQueue retryQueue,
                      DeadLetterQueue deadLetters, InFlightIndex inFlight) {

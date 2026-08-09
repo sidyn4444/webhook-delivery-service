@@ -44,6 +44,34 @@
         </dependency>
 
         <!--
+            WHY (19d): so Kubernetes can ask this worker whether it is healthy.
+
+            Until now the worker had no endpoint of any kind, which made its worst
+            failure INVISIBLE: if the poll thread dies, the process stays up, keeps
+            healthy connections to Redis and Postgres, and consumes nothing forever.
+            There is no request to fail and no exception left to log.
+
+            Actuator turns that into an answerable question. It supplies a `redis`
+            check and a `db` check for free (because those libraries are present),
+            and PollLoopHealthIndicator adds the one nothing else can know about.
+
+            ⚠️ NO web starter is needed alongside it. spring-boot-starter-webflux is
+            already here for WebClient (9a), and it ships Netty — so the server was
+            always on the classpath, and web-application-type=none was the only thing
+            stopping it from binding a port. 19d flips that setting to `reactive`
+            rather than adding Tomcat, so the HTTP layer costs one dependency.
+
+            ⚠️ AND THE REASON THERE IS NO CHEAPER OPTION: Kubernetes can probe by
+            running a command inside the container instead of over HTTP — but this
+            image is distroless (19b), so there is no shell, no curl, nothing to run.
+            The security choice made in the Dockerfile is what forces an HTTP endpoint.
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+
+        <!--
             WHY: the worker's whole existence is reading jobs OFF the queue the
             producer fills. This brings Lettuce (the Redis client) plus Spring's
             StringRedisTemplate, and auto-configures the connection from the
