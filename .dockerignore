@@ -1,0 +1,86 @@
+# =============================================================
+#  .dockerignore — what Docker must NEVER copy into an image.
+#
+#  Same idea as .gitignore, different audience: .gitignore keeps files out of
+#  the repository, this keeps files out of the IMAGE.
+#
+#  Why it matters: `COPY . /app` in a Dockerfile copies EVERYTHING in this
+#  folder. An image is a file that gets pushed to a registry and pulled by any
+#  machine that can reach it — so a secret copied into one is a secret
+#  published. Measured at 19a: without this file the throwaway image contained
+#  a readable copy of .env and the whole .git history.
+#
+#  Second effect: everything here is also skipped when Docker sends the build
+#  context to the daemon, which is why the build gets dramatically faster.
+#
+#  ⚠️ KEEP pom.xml AND src/ — the build stage compiles from source inside the
+#  image, so excluding those would break the build rather than slim it.
+# =============================================================
+
+
+# --- Secrets: the reason this file exists ---------------------
+#  Real local credentials. .env.example is deliberately NOT excluded — it holds
+#  dummy values only and is committed on purpose.
+.env
+.env.local
+application-local.properties
+secrets/
+*.key
+*.pem
+
+
+# --- Build output ---------------------------------------------
+#  Compiled classes and JARs from builds run on the laptop. Excluded because
+#  the image builds its own from source — copying these in would ship stale
+#  artifacts that silently differ from the source next to them.
+#  The ** prefix matches at any depth: producer/target, worker/target, etc.
+**/target/
+
+
+# --- Version control -----------------------------------------
+#  .git is the entire project history, including every version of every file
+#  ever committed. Nothing at runtime reads it.
+.git
+.gitignore
+.gitattributes
+
+
+# --- Personal / private material -----------------------------
+#  Learning notes, the project brief and the checklists. Gitignored already,
+#  and there is no reason for them to be inside a running container.
+docs/
+notes/
+checklists/
+.claude/
+
+
+# --- Editor and OS noise -------------------------------------
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.settings/
+.classpath
+.project
+.DS_Store
+Thumbs.db
+
+
+# --- Logs -----------------------------------------------------
+*.log
+logs/
+
+
+# --- Things that describe how to RUN the system, not part of it
+#  Deployment descriptors are read by Docker Compose, kubectl and Helm from
+#  OUTSIDE the container. An image containing its own manifests is carrying
+#  instructions it can never act on.
+docker-compose.yml
+k8s/
+deploy/
+monitoring/
+scripts/
+docker/
+Dockerfile*
+.dockerignore
