@@ -1,0 +1,225 @@
+# =============================================================================
+#  Redis — the queue. LOCAL / DEV ONLY.
+#
+#  🔴 IN PRODUCTION THIS FILE DOES NOT EXIST. AWS ElastiCache replaces it, and
+#  the only change on the application side is one value in the ConfigMap:
+#  REDIS_HOST stops saying "redis" and says the ElastiCache endpoint instead.
+#  That one-value migration is the entire reason Redis lives in-cluster rather
+#  than on the host's docker-compose: the setting is already a NAME pointing at
+#  something inside, so Session 5 changes a value and not a mechanism.
+#
+#  Config mirrors docker-compose.yml on purpose (redis:7-alpine, the same
+#  --requirepass, the same authenticated PING as its health check), because three
+#  sessions of behaviour were proven against that configuration. Two deliberate
+#  departures, both explained below: NO VOLUME, and strategy: Recreate.
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: webhooks
+  labels:
+    app: redis
+    app.kubernetes.io/part-of: webhook-delivery-service
+spec:
+  replicas: 1
+
+  # ---------------------------------------------------------------------------
+  # 🔴 Recreate, NOT the default RollingUpdate — and this is a correctness fix,
+  # not a preference.
+  #
+  # RollingUpdate starts the NEW pod before killing the old one, so for a moment
+  # TWO Redis pods are Ready and the Service load-balances across BOTH. They
+  # share no data. The producer would LPUSH into one while the worker BRPOPLPUSHes
+  # from the other -- jobs sitting in a Redis nobody is reading, and a worker
+  # blocked on an empty queue, with every pod reporting healthy.
+  #
+  # Recreate terminates the old pod first, so at most one Redis is ever behind
+  # this Service. The cost is a few seconds of total unavailability on every
+  # change; correct behaviour is worth more than uptime we do not need locally.
+  #
+  # ⚠️ THE GENERAL RULE: RollingUpdate is safe for STATELESS replicas (our
+  # producer and worker) and unsafe for a single stateful instance, because
+  # "briefly two of them" is harmless only when they hold nothing.
+  # ---------------------------------------------------------------------------
+  strategy:
+    type: Recreate
+
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      # -----------------------------------------------------------------------
+      # 🔴 enableServiceLinks: false -- FOUND BY MEASUREMENT AT 21c, and it is a
+      # landmine for our own apps rather than for this pod.
+      #
+      # By default Kubernetes injects legacy Docker-link environment variables for
+      # EVERY Service in the namespace: REDIS_SERVICE_HOST, REDIS_PORT_6379_TCP,
+      # and -- the problem -- REDIS_PORT=tcp://10.102.66.139:6379. Sixteen of them,
+      # measured. `REDIS_PORT` is exactly the name of one of OUR ConfigMap keys, so
+      # a producer that does not set it explicitly receives "tcp://10.x.x.x:6379"
+      # and dies with:
+      #     Failed to bind properties under 'spring.data.redis.port' to int
+      # An explicit configMapKeyRef wins over the injected value, so the real
+      # Deployments are safe -- but this switches the whole class of collision off
+      # rather than relying on always remembering to override it.
+      #
+      # ⚠️ It could not have been found before this sub-task: the variables only
+      # exist once a Service named `redis` exists, so every producer pod at 20c and
+      # 21a ran in a namespace where the collision was impossible.
+      # -----------------------------------------------------------------------
+      enableServiceLinks: false
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        imagePullPolicy: IfNotPresent
+
+        # -------------------------------------------------------------------
+        # $(REDIS_PASSWORD) is expanded by KUBERNETES from the container's env
+        # before the process starts -- it is not shell syntax and no shell is
+        # involved. Note the round brackets: ${VAR} would be passed through
+        # literally and Redis would set the password to the eight characters
+        # "${REDIS...".
+        #
+        # ⚠️ Cost, stated: the expanded password ends up in the container's argv,
+        # so `ps` INSIDE this container would show it. The hardened form is a
+        # redis.conf mounted from the Secret. Not done here because this pod is
+        # dev-only and anyone who can exec into it can already read the Secret.
+        # (`kubectl describe pod` shows the UNEXPANDED "$(REDIS_PASSWORD)",
+        # because expansion happens at container start, not in the stored spec.)
+        # -------------------------------------------------------------------
+        command: ["redis-server"]
+        args: ["--requirepass", "$(REDIS_PASSWORD)"]
+
+        env:
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: webhook-secrets
+              key: REDIS_PASSWORD
+
+        ports:
+        - name: redis
+          containerPort: 6379
+
+        # -------------------------------------------------------------------
+        # exec probes, and the reason they are possible HERE and not for our own
+        # services: redis:7-alpine ships a shell and redis-cli. Our images are
+        # distroless -- no shell, nothing to exec -- which is exactly why 19d had
+        # to add an HTTP endpoint to the worker. Same problem, two solutions,
+        # decided entirely by what is inside the image.
+        #
+        # ⚠️ An exec probe is NOT free: it forks a process inside the container on
+        # every period. Cheap at 10s; a 1s exec probe on a busy pod is real load.
+        #
+        # An AUTHENTICATED ping, not a port check -- an open port proves the
+        # process started, a successful AUTH proves the password is right too. A
+        # weaker check passes in a state the application cannot use.
+        # `grep -q PONG` because redis-cli can exit 0 while printing an error.
+        # -------------------------------------------------------------------
+        readinessProbe:
+          exec:
+            command:
+            - sh
+            - -c
+            - redis-cli -a "$REDIS_PASSWORD" --no-auth-warning ping | grep -q PONG
+          initialDelaySeconds: 2
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+
+        # Liveness asks only "is the process wedged?" -- would a restart fix it?
+        # A plain PING with no auth answers that: NOAUTH still proves the server
+        # is responding to commands. Deliberately does NOT check the password,
+        # because a wrong password is a config error a restart cannot fix, and
+        # restarting on it would produce a CrashLoop over a typo.
+        livenessProbe:
+          exec:
+            command: ["sh", "-c", "redis-cli ping 2>&1 | grep -qE 'PONG|NOAUTH'"]
+          initialDelaySeconds: 10
+          periodSeconds: 15
+          timeoutSeconds: 3
+          failureThreshold: 3
+
+        # -------------------------------------------------------------------
+        # requests = what the scheduler reserves. limits = the hard ceiling.
+        # 🔴 LOAD-BEARING, not ceremonial: 20a measured this node advertising the
+        # HOST's 8 CPU / 6 GB rather than its own 4.5 GB cap (docker driver -> the
+        # kubelet reads the host's /proc). So the scheduler believes it has ~33%
+        # more memory than Docker will allow and will accept a workload Docker
+        # then OOMKills. Requests are what keep the total honest.
+        #
+        # ⚠️ The two limits fail differently: over the MEMORY limit is an instant
+        # kill (OOMKilled); over the CPU limit is silent throttling.
+        # -------------------------------------------------------------------
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+          limits:
+            memory: "256Mi"
+            cpu: "300m"
+
+        # ⚠️ NO runAsNonRoot HERE, DELIBERATELY -- see 04-postgres.yaml. The
+        # official Redis image starts as root and drops to the `redis` user in its
+        # own entrypoint, so forcing non-root breaks the entrypoint. Our OWN
+        # images are genuinely non-root and DO get this hardening at 21d/21e.
+        securityContext:
+          allowPrivilegeEscalation: false
+
+      # 🔴 NO `volumes:` AND NO VOLUME MOUNT, ON PURPOSE.
+      #
+      # Consequence, and it is narrower and nastier than "the pod holds the data":
+      # the data lives in the CONTAINER's writable filesystem. If this container
+      # crashes and is restarted, Kubernetes builds a BRAND-NEW container from the
+      # image with an empty filesystem -- same pod, same name, same IP, RESTARTS
+      # ticks 0 -> 1 -- and the queue, retry set, in-flight index and dead-letter
+      # list are all gone while `kubectl get pods` shows Running.
+      #
+      # THE HABIT THAT FALLS OUT: when a datastore's counts are unexpectedly zero,
+      # read the RESTARTS column before assuming nothing was ever written. A reset
+      # and an empty write path give an identical reading.
+      #
+      # Not because minikube cannot persist -- it ships a storage-provisioner and a
+      # PersistentVolumeClaim would work. Skipped because this is dev-only, it
+      # costs memory and disk on an 8 GB laptop, and the reset is USEFUL: it is
+      # what makes Task 22's deliberate breakage cheap to recover from.
+      # Production answer: ElastiCache, which is somebody else's durability problem.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: webhooks
+  labels:
+    app: redis
+    app.kubernetes.io/part-of: webhook-delivery-service
+spec:
+  # ClusterIP = reachable ONLY from inside the cluster. Correct here, and note it
+  # is also why the end-to-end target has to stay webhook.site: a receiver run
+  # in-cluster would get a private address, and 16a's SSRF gate rejects private
+  # addresses on purpose. The security control working, and standing in the way.
+  type: ClusterIP
+
+  # 🔴 THIS is what makes REDIS_HOST=redis work, and the reason a Service exists
+  # at all: pods are destroyed and replaced constantly and every replacement gets
+  # a NEW IP, so nothing may address a pod directly. The Service name resolves via
+  # the cluster's DNS to a stable virtual IP, which forwards to whichever pods
+  # currently pass their readiness probe.
+  #
+  # ⚠️ The selector is a LABEL QUERY, not a reference to the Deployment. It matches
+  # pods by label, so a typo here does not error -- it silently selects nothing,
+  # the Service ends up with zero endpoints, and connections fail with the
+  # Deployment looking perfectly healthy. Same silent-omission shape as a
+  # mistyped ConfigMap key (21a) and a mistyped health indicator name (19d).
+  selector:
+    app: redis
+  ports:
+  - name: redis
+    port: 6379          # the port the Service answers on
+    targetPort: 6379    # the port on the pod it forwards to
+    protocol: TCP

@@ -80,3 +80,20 @@ data:
   # because a JDBC URL is one opaque string and Postgres cannot read it.
   # ---------------------------------------------------------------------------
   POSTGRES_URL: "jdbc:postgresql://postgres:5432/webhookdb"
+
+  # ---------------------------------------------------------------------------
+  # ADDED AT 21c, not before -- and the delay was the point. Nothing read this
+  # key until the Postgres container existed, and a key no container reads is
+  # dead config that still reads as configured. It arrives in the same sub-task
+  # as its only consumer.
+  #
+  # Read by the POSTGRES POD ITSELF (its entrypoint creates this database on
+  # first boot), not by either application: the apps get the database name from
+  # inside POSTGRES_URL above.
+  #
+  # ⚠️ So the name webhookdb now lives in TWO places in this file. Unavoidable --
+  # a JDBC URL is one opaque string and Postgres cannot read it -- and if they
+  # disagree the failure is loud: Flyway cannot connect, the Spring context
+  # fails, the worker exits (19c). Change one, change both.
+  # ---------------------------------------------------------------------------
+  POSTGRES_DB: "webhookdb"

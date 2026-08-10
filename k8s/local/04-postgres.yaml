@@ -1,0 +1,183 @@
+# =============================================================================
+#  Postgres — the delivery-attempt log. LOCAL / DEV ONLY.
+#
+#  🔴 IN PRODUCTION THIS FILE DOES NOT EXIST. AWS RDS replaces it, and the only
+#  application-side change is one value in the ConfigMap: POSTGRES_URL stops
+#  naming the in-cluster Service and names the RDS endpoint.
+#
+#  Mirrors docker-compose.yml (postgres:16-alpine, the same three env vars, the
+#  same pg_isready health check). Same two deliberate departures as Redis: NO
+#  VOLUME, and strategy: Recreate.
+#
+#  ⚠️ WHY NO VOLUME IS WORSE HERE THAN FOR REDIS, AND WHY IT IS STILL ACCEPTABLE:
+#  Redis holds work in flight; Postgres holds the AUDIT RECORD, which 10d
+#  deliberately writes BEFORE acking a job precisely because a lost record is
+#  unrecoverable. Deleting this pod destroys that record. Acceptable only because
+#  it is dev-only and Flyway rebuilds an empty schema on the next boot; in
+#  production this is exactly what RDS with backups exists for.
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: webhooks
+  labels:
+    app: postgres
+    app.kubernetes.io/part-of: webhook-delivery-service
+spec:
+  replicas: 1
+
+  # Recreate for the same reason as Redis, and the failure is worse: two Postgres
+  # pods behind one Service means Flyway migrating one database while the worker
+  # writes rows to the other -- and `spring.jpa.hibernate.ddl-auto=validate` would
+  # fail against the unmigrated one, so the symptom is an intermittent startup
+  # crash that depends on which pod the Service happened to pick.
+  strategy:
+    type: Recreate
+
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      # -----------------------------------------------------------------------
+      # 🔴 enableServiceLinks: false -- FOUND BY MEASUREMENT AT 21c, and it is a
+      # landmine for our own apps rather than for this pod.
+      #
+      # By default Kubernetes injects legacy Docker-link environment variables for
+      # EVERY Service in the namespace: REDIS_SERVICE_HOST, REDIS_PORT_6379_TCP,
+      # and -- the problem -- REDIS_PORT=tcp://10.102.66.139:6379. Sixteen of them,
+      # measured. `REDIS_PORT` is exactly the name of one of OUR ConfigMap keys, so
+      # a producer that does not set it explicitly receives "tcp://10.x.x.x:6379"
+      # and dies with:
+      #     Failed to bind properties under 'spring.data.redis.port' to int
+      # An explicit configMapKeyRef wins over the injected value, so the real
+      # Deployments are safe -- but this switches the whole class of collision off
+      # rather than relying on always remembering to override it.
+      #
+      # ⚠️ It could not have been found before this sub-task: the variables only
+      # exist once a Service named `redis` exists, so every producer pod at 20c and
+      # 21a ran in a namespace where the collision was impossible.
+      # -----------------------------------------------------------------------
+      enableServiceLinks: false
+      containers:
+      - name: postgres
+        image: postgres:16-alpine
+        imagePullPolicy: IfNotPresent
+
+        env:
+        # Credentials from the Secret. The username is here too because it is half
+        # of a credential and a credential belongs in one place (21b).
+        - name: POSTGRES_USER
+          valueFrom:
+            secretKeyRef:
+              name: webhook-secrets
+              key: POSTGRES_USER
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: webhook-secrets
+              key: POSTGRES_PASSWORD
+        # 🔴 The database NAME is not a secret, so it comes from the ConfigMap --
+        # and it was deliberately left OUT of the ConfigMap until now, because
+        # until this container existed nothing read it, and a key nothing reads is
+        # dead config that still reads as configured (21a's closed-list rule).
+        #
+        # ⚠️ It must agree with the database name embedded in POSTGRES_URL. One
+        # fact in two places, unavoidable: a JDBC URL is one opaque string and
+        # Postgres cannot read it. The failure is at least loud -- Flyway cannot
+        # connect, the Spring context fails, and the worker exits (19c).
+        - name: POSTGRES_DB
+          valueFrom:
+            configMapKeyRef:
+              name: webhook-config
+              key: POSTGRES_DB
+
+        ports:
+        - name: postgres
+          containerPort: 5432
+
+        # -------------------------------------------------------------------
+        # pg_isready is Postgres' own "are you accepting connections?" tool, and
+        # it ships inside the image -- the exec probe is available for the same
+        # reason as Redis', and unavailable for our distroless images.
+        #
+        # ⚠️ -U and -d matter: bare `pg_isready` checks the server is up, but the
+        # server accepts connections for several seconds BEFORE the entrypoint has
+        # finished creating our user and database. Naming both means readiness
+        # tracks "usable by us", not "listening". This is the compose
+        # `depends_on`-vs-healthcheck trap in a new form.
+        # -------------------------------------------------------------------
+        readinessProbe:
+          exec:
+            command: ["sh", "-c", 'pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" -h 127.0.0.1']
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 6
+
+        # Liveness deliberately checks LESS: is the server process responding at
+        # all? A missing role or database is a config problem a restart cannot fix,
+        # so it must not trigger restarts -- otherwise a typo in POSTGRES_DB
+        # becomes an endless CrashLoop instead of a pod sitting at 0/1 Ready with a
+        # readable reason.
+        livenessProbe:
+          exec:
+            command: ["sh", "-c", "pg_isready -h 127.0.0.1 -q || test $? -eq 2"]
+          initialDelaySeconds: 20
+          periodSeconds: 20
+          timeoutSeconds: 5
+          failureThreshold: 3
+
+        # Larger than Redis because Postgres allocates shared buffers up front and
+        # the worker opens a Hikari pool of 5 connections, each of which is a
+        # backend process. Real budget: ~4.5 GB minus ~700 MB of control plane,
+        # shared with the producer and three workers.
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+
+        # 🔴 NO runAsNonRoot, AND THIS IS THE INTERESTING ONE.
+        #
+        # The official Postgres image's entrypoint STARTS AS ROOT on purpose: it
+        # has to create the data directory, fix its ownership, and initialise the
+        # cluster, and only then does it drop to the `postgres` user itself. Force
+        # runAsNonRoot: true and the entrypoint cannot do step one, so the
+        # container fails before Postgres ever starts.
+        #
+        # ⚠️ THE LESSON, AND IT IS THE POINT OF THIS BLOCK: security hardening is
+        # not a checklist you apply uniformly. "Always run non-root" is right for
+        # an image you built to be non-root -- ours are, uid 65532, and they DO get
+        # this at 21d/21e -- and wrong for a third-party image that manages the
+        # privilege drop itself. Copying the stricter block everywhere produces a
+        # CrashLoop whose cause is your own security policy.
+        securityContext:
+          allowPrivilegeEscalation: false
+
+      # NO volume, on purpose -- see the header, and 03-redis.yaml for the full
+      # reasoning on why a CONTAINER restart is enough to lose it.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: webhooks
+  labels:
+    app: postgres
+    app.kubernetes.io/part-of: webhook-delivery-service
+spec:
+  type: ClusterIP
+  selector:
+    app: postgres
+  ports:
+  - name: postgres
+    port: 5432
+    targetPort: 5432
+    protocol: TCP
