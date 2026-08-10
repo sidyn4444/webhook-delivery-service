@@ -1,0 +1,82 @@
+# =============================================================================
+#  webhook-config — every NON-SECRET setting that differs between environments
+#
+#  LOCAL / DEV ONLY. The production equivalents live in k8s/eks/ (Session 5),
+#  where these same three keys point at ElastiCache and RDS instead.
+#
+#  THE RULE THAT DECIDES WHAT GOES IN HERE — two questions, three destinations:
+#    1. Does the value differ per environment?
+#         NO  -> leave it literal in application.properties, baked into the JAR
+#               (server.port, the Redis timeouts, the probe group membership)
+#    2. It differs. Must it be hidden?
+#         NO  -> here, in this ConfigMap
+#         YES -> a Secret (02-secret.yaml)
+#
+#  Freezing a value that had to vary is as much a bug as publishing one that
+#  had to be hidden. The literals in application.properties are literal ON
+#  PURPOSE: if server.port could drift between the laptop and EKS, the Service
+#  targetPort would be right in one place and wrong in the other.
+#
+#  WHY THIS FILE EXISTS AT ALL:
+#  One image has to run on a laptop, in minikube, and on EKS. Bake the settings
+#  in and you need three images -- and then the thing you tested is not the
+#  thing you shipped. Config on the outside means ONE image, everywhere.
+#
+#  THE KEYS BELOW ARE A CLOSED LIST, NOT A SELECTION.
+#  They are exactly the non-secret ${...} placeholders in the two
+#  application.properties files. Nothing else belongs here, because a key no
+#  container reads is dead config that still reads as configured -- and the
+#  next person assumes it is doing something.
+#
+#  HOW A DEPLOYMENT SHOULD CONSUME IT (21d/21e):
+#  Name each key explicitly with configMapKeyRef, never envFrom. A missing key
+#  named explicitly REFUSES TO START the container (CreateContainerConfigError).
+#  The same missing key under envFrom is silently omitted, the app falls back to
+#  its default, and the manifest still reads perfectly.
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: webhook-config
+  namespace: webhooks
+  labels:
+    app.kubernetes.io/part-of: webhook-delivery-service
+data:
+  # ---------------------------------------------------------------------------
+  # REDIS_HOST is a Kubernetes SERVICE NAME, not a hostname anyone typed.
+  #
+  # 'redis' resolves, via the cluster's own DNS, to whichever Redis pod is
+  # currently healthy (Service created in 21c). Pod IPs change constantly, so
+  # nothing may address a pod directly.
+  #
+  # This replaces host.docker.internal from 19b, which has no meaning inside a
+  # pod -- and 'localhost' would be worse than wrong: inside a pod, localhost is
+  # THE POD ITSELF, so the producer would look for a Redis running inside the
+  # producer and find nothing.
+  #
+  # It is also the whole payoff of the in-cluster decision: in Session 5 this
+  # single value becomes the ElastiCache endpoint. One value, one file.
+  # ---------------------------------------------------------------------------
+  REDIS_HOST: "redis"
+
+  # Quoted because ConfigMap values are ALWAYS strings. Unquoted 6379 is still
+  # accepted, but YAML would parse it as an integer first and the apply fails
+  # with a type error -- a confusing message for an obviously-correct value.
+  REDIS_PORT: "6379"
+
+  # ---------------------------------------------------------------------------
+  # Read by the WORKER only (the producer never touches Postgres). It is listed
+  # in one shared ConfigMap rather than a per-service one because REDIS_HOST is
+  # identical for both services, and duplicating it would mean two files to edit
+  # when EKS arrives -- the version-drift failure from the parent POM in 5c.
+  #
+  # Naming keys explicitly per container is what makes one shared map safe: the
+  # producer's Deployment simply never references this key, so its pod does not
+  # receive it and the manifest does not overstate what the producer needs.
+  #
+  # 'postgres' is a Service name for the same reason as 'redis'. The database
+  # name webhookdb is embedded here; the Postgres pod at 21c needs it again as
+  # its own POSTGRES_DB, so that name will exist in two places -- unavoidable,
+  # because a JDBC URL is one opaque string and Postgres cannot read it.
+  # ---------------------------------------------------------------------------
+  POSTGRES_URL: "jdbc:postgresql://postgres:5432/webhookdb"
