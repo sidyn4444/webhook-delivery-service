@@ -6,6 +6,20 @@ application-local.properties
 *.pem
 secrets/
 
+# Any Kubernetes Secret manifest holding real values. The real Secret is created
+# imperatively from .env and is never written to disk (see
+# k8s/local/02-secret.example.yaml) — this is the belt-and-braces control for the
+# git channel specifically, because history is append-only: one `git add -f` or
+# one stray `kubectl ... -o yaml > file` publishes an HMAC key permanently.
+k8s/**/*secret*.yaml
+k8s/**/*secret*.yml
+# ...but the dummy-valued TEMPLATE is meant to be committed. Note its extension:
+# `02-secret.yaml.example`, NOT `.example.yaml`. `kubectl apply -f <dir>` reads only
+# .yaml/.yml/.json, so this ordering makes the template invisible to a directory
+# apply — which matters because it carries `metadata.name: webhook-secrets` and
+# would otherwise OVERWRITE the real credentials with its dummy values.
+!k8s/**/*secret*.yaml.example
+
 # ===== Maven build output =====
 target/
 !.mvn/wrapper/maven-wrapper.jar
