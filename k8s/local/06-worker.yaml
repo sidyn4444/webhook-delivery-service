@@ -1,0 +1,290 @@
+# =============================================================================
+#  Worker — the delivery consumer. Deployment ONLY. 🔴 NO SERVICE, DELIBERATELY.
+#
+#  A Service is a stable address in front of pods so that OTHER things can call
+#  them. Nothing calls a worker. It reaches out and PULLS jobs off Redis itself
+#  (the reliable-queue pattern from 9b), so there is no inbound traffic to route
+#  and therefore nothing to put an address in front of.
+#
+#  ⚠️ Then how do the probes reach it? THE KUBELET TALKS TO THE POD DIRECTLY, by
+#  pod IP, on the port named below. Probes have never needed a Service -- they are
+#  run by the kubelet on the node the pod is on, not routed through the cluster
+#  network. Easy to assume otherwise, because a Service is the only way *you* can
+#  reach a pod by name.
+#
+#  ⚠️ Week 6 may add a headless Service so Prometheus can DISCOVER these pods to
+#  scrape /actuator/prometheus. That would be for discovery, not for traffic --
+#  still nothing calling the worker.
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: webhooks
+  labels:
+    app: worker
+    app.kubernetes.io/part-of: webhook-delivery-service
+spec:
+  # ---------------------------------------------------------------------------
+  # THREE replicas -- the first time multiple consumers share one queue in this
+  # cluster. They must never share a JOB, and that property is not luck: it comes
+  # from the atomic BRPOPLPUSH in 9b (a job moves to `processing` in one
+  # indivisible step, so two workers cannot both take it) plus the in-flight
+  # index from 14a. 22b is where that gets proven properly; three replicas is
+  # what makes it possible to prove.
+  # ---------------------------------------------------------------------------
+  replicas: 3
+
+  # ---------------------------------------------------------------------------
+  # maxSurge: 0 -- and this is a BUDGET decision, not a correctness one.
+  #
+  # The producer uses maxSurge: 1 / maxUnavailable: 0, because a front door must
+  # never lose capacity mid-deploy. A worker can: fewer consumers for thirty
+  # seconds means the queue drains more slowly, and nothing is lost or refused --
+  # the jobs simply wait, which is what a queue is for.
+  #
+  # maxSurge: 1 would need room for a FOURTH worker pod while rolling, and 21d
+  # measured this node's honest budget at ~3.8 GB against requests already near
+  # 3.1 GB. A surge pod that cannot be scheduled sits Pending and STALLS THE
+  # ROLLOUT -- so on a tight node, replace-in-place is the safer shape.
+  # ---------------------------------------------------------------------------
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 0
+
+  selector:
+    matchLabels:
+      app: worker
+  template:
+    metadata:
+      labels:
+        app: worker
+    spec:
+      # Load-bearing here for the same reason as the producer: the worker reads
+      # REDIS_PORT, and Kubernetes injects REDIS_PORT=tcp://10.x.x.x:6379 into
+      # every pod in this namespace because a Service named `redis` exists (21c).
+      enableServiceLinks: false
+
+      # The worker's shutdown is a real handshake, not a kill: 9b sets a volatile
+      # flag and JOINs the poll thread, and that thread can be parked up to 5s on
+      # a blocking BRPOPLPUSH. 30s (the default) is comfortably more than enough;
+      # stated explicitly so nobody tunes it below the blocking-pop window, which
+      # would turn every graceful stop into a SIGKILL.
+      terminationGracePeriodSeconds: 30
+
+      # Identical to the producer, and correct for the same reason: this is an
+      # image WE built to run as uid 65532. The Dockerfile only ASKS; this
+      # ENFORCES. (21c is the counter-example -- the same block breaks official
+      # Postgres, which starts as root on purpose.)
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+      - name: worker
+        image: webhook-worker:0.1.0
+        imagePullPolicy: IfNotPresent      # the image is on the node (20b), not in a registry
+
+        ports:
+        - name: mgmt                       # MANAGEMENT only -- no application traffic
+          containerPort: 8081              # ever arrives here. Probes, and Prometheus in Wk6.
+
+        # -------------------------------------------------------------------
+        # SEVEN variables, against the producer's three -- the worker is the only
+        # service that touches Postgres and the only one that signs payloads.
+        # Every key named explicitly (21a): a missing key named this way refuses
+        # to start the container, while envFrom would skip it silently and let a
+        # placeholder fall back.
+        # -------------------------------------------------------------------
+        env:
+        - name: REDIS_HOST
+          valueFrom:
+            configMapKeyRef: { name: webhook-config, key: REDIS_HOST }
+        - name: REDIS_PORT
+          valueFrom:
+            configMapKeyRef: { name: webhook-config, key: REDIS_PORT }
+        - name: POSTGRES_URL
+          valueFrom:
+            configMapKeyRef: { name: webhook-config, key: POSTGRES_URL }
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef: { name: webhook-secrets, key: REDIS_PASSWORD }
+        - name: POSTGRES_USER
+          valueFrom:
+            secretKeyRef: { name: webhook-secrets, key: POSTGRES_USER }
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef: { name: webhook-secrets, key: POSTGRES_PASSWORD }
+        # The HMAC signing key. Read only by the worker -- the producer never
+        # signs anything, because signing happens at delivery time (15b).
+        - name: HMAC_SECRET
+          valueFrom:
+            secretKeyRef: { name: webhook-secrets, key: HMAC_SECRET }
+
+        # -------------------------------------------------------------------
+        # STARTUP -- a bigger budget than the producer's, and for a real reason:
+        # this app runs FLYWAY during context initialisation (10c), so it cannot
+        # bind its port until the database schema has been checked or created.
+        # With three replicas booting at once, three Flyway instances contend for
+        # the same migration lock, so one of them waits for the others.
+        # 3s x 20 = 60s. The producer needed 30s and has no database at all.
+        # -------------------------------------------------------------------
+        startupProbe:
+          httpGet:
+            path: /actuator/health/liveness
+            port: mgmt
+          periodSeconds: 3
+          failureThreshold: 20             # 20 x 3s = 60s to migrate and boot
+          timeoutSeconds: 3
+
+        # -------------------------------------------------------------------
+        # 🔴 READINESS -- AND ITS JOB HERE IS COMPLETELY DIFFERENT FROM THE
+        # PRODUCER'S. It changes NOTHING at runtime: readiness failing removes a
+        # pod from a Service's endpoints, and this Deployment has no Service, so
+        # there is no traffic to withhold. A worker that cannot reach Redis just
+        # keeps retrying, exactly as it would if nobody were watching.
+        #
+        # Its one real job is GATING ROLLOUTS -- and note which pods that
+        # protects: Kubernetes will not tear down a WORKING worker until the
+        # replacement reports Ready. So a new version that cannot reach Redis
+        # leaves the rollout stalled with the old workers still running and
+        # consuming, instead of replacing them all with pods that can do nothing.
+        # The symptom looks like a bug and is the feature: new pods stuck at
+        # 0/1, old pods still up, no progress.
+        #
+        # 🔴 timeoutSeconds: 15, NOT the producer's 5. The group is
+        # readinessState + redis + db, and the worker's spring.data.redis.timeout
+        # is 10s (19d measured this endpoint answering in 10.05s) against the
+        # producer's 2s. Kubernetes defaults timeoutSeconds to 1. Two services,
+        # two client timeouts, two different correct numbers -- remembering it as
+        # one fact about "the system" puts the wrong value in one manifest.
+        # -------------------------------------------------------------------
+        readinessProbe:
+          httpGet:
+            path: /actuator/health/readiness
+            port: mgmt
+          periodSeconds: 15
+          timeoutSeconds: 15
+          failureThreshold: 3
+
+        # -------------------------------------------------------------------
+        # 🔴 LIVENESS -- THE IMPORTANT ONE ON THIS SERVICE, and the whole reason
+        # 19d gave the worker an HTTP port at all.
+        #
+        # The group is livenessState + pollLoop. `pollLoop` is
+        # PollLoopHealthIndicator, the only health check in this project we wrote
+        # ourselves -- because Spring registers `redis` and `db` for free from the
+        # classpath, and nothing in Spring knows the real work happens on a thread
+        # JobPoller started.
+        #
+        # The failure it exists to catch: the poll thread dies from an Error, and
+        # the process stays up holding healthy Redis and Postgres connections,
+        # answering every other check UP, consuming nothing, forever. No request
+        # fails because nobody sends requests. Nothing is logged because nothing
+        # threw. From outside, a worker doing nothing and a worker with nothing to
+        # do are identical.
+        #
+        # ⚠️ And it reads pollThread.isAlive() -- the JVM's answer -- rather than
+        # JobPoller.isRunning(), a volatile flag WE set, which stays true when the
+        # thread dies. The obvious implementation reports UP for exactly the
+        # failure it was written to detect.
+        #
+        # Would a restart fix a dead thread? Yes -- a new process starts a new
+        # thread. So it belongs in liveness. And note it does NOT include redis or
+        # db: a restart cannot produce a Redis, and putting it here would convert
+        # a Redis outage into a fleet-wide restart loop.
+        #
+        # timeoutSeconds: 3 is fine because this endpoint touches NO dependency --
+        # it reads a boolean off a thread object. 19d measured 7ms.
+        # -------------------------------------------------------------------
+        livenessProbe:
+          httpGet:
+            path: /actuator/health/liveness
+            port: mgmt
+          periodSeconds: 20
+          timeoutSeconds: 3
+          failureThreshold: 3
+
+        # -------------------------------------------------------------------
+        # RESOURCES. Deliberately STARTING GENEROUS at the producer's 512Mi and
+        # tightening to a measured number in this same sub-task -- because
+        # "start tight and raise it" gives you OOMKilled pods and throttled
+        # startups to debug, while "start generous and lower it" gives you a
+        # slightly wasteful pod you then correct. Same direction the rule in
+        # foundations/07 insists on.
+        #
+        # cpu 100m request: the worker is I/O-BOUND -- it spends its life parked
+        # on a blocking BRPOPLPUSH or waiting for a subscriber to answer, and
+        # waiting on a socket costs no CPU. So its steady-state usage is very low,
+        # AND that is exactly why it gets no HPA (decision #6): a worker holding a
+        # 10,000-job backlog and an idle worker report the SAME CPU, so an
+        # autoscaler reading CPU could not tell drowning from idle.
+        # The request still matters -- it is what the scheduler reserves.
+        #
+        # cpu 1 limit: set by JVM startup plus Flyway, not steady state.
+        # Written as "1" not "1000m" because the API server normalises 1000m -> 1
+        # and the mismatch makes every `kubectl apply` print `configured` forever
+        # (measured at 21d).
+        # -------------------------------------------------------------------
+        # 🔴 MEASURED AFTER DEPLOYING, AND THE NUMBERS WERE LEFT ALONE ON PURPOSE.
+        #
+        # Steady state, three pods: 46-58m CPU and 246-273Mi memory. So 100m CPU
+        # is ~2x headroom, which is right. Memory looks like it could drop to
+        # 384Mi -- and it was NOT dropped, because the measurement is of an
+        # essentially IDLE system: one job had been delivered in total.
+        #
+        # ⚠️ AN IDLE MEASUREMENT TELLS YOU THE FLOOR, NOT THE CEILING. A limit is
+        # a ceiling, so tightening it on an idle reading is guessing dressed up as
+        # data. Under real load these pods hold outbound TLS connections, a Hikari
+        # pool of 5, and JPA state. The honest number comes from Session 6's load
+        # test; until then 512Mi stays and this comment says why.
+        #
+        # ⚠️ AND A MEASUREMENT TRAP WORTH KNOWING: the FIRST sample, ~90s after
+        # rollout, read 845-917m CPU -- essentially pegged at the limit -- which
+        # looks exactly like a busy-wait bug. It was JVM startup plus JIT plus
+        # Flyway, and `kubectl top` reports a windowed average, so a reading taken
+        # shortly after boot still contains the boot. Three samples 25s apart
+        # settled at 46-58m. Never size a container from a fresh pod.
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "512Mi"
+          limits:
+            cpu: "1"
+            memory: "512Mi"
+
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+
+        volumeMounts:
+        # 🔴 TESTED, AND THE RESULT WAS THE OPPOSITE OF THE PRODUCER'S.
+        #
+        # 21d proved the producer CANNOT start with readOnlyRootFilesystem and no
+        # writable /tmp -- Tomcat calls Files.createTempDirectory during boot. The
+        # same experiment on THIS image starts cleanly: `Started WorkerApplication`,
+        # Ready, no filesystem errors. The worker runs Netty (reactive, 19d), not
+        # Tomcat, and Netty does not need a temp directory to come up.
+        #
+        # So this mount is NOT required for startup, and it is kept anyway for one
+        # honest reason: the test only exercised STARTUP. The outbound HTTPS
+        # delivery path -- TLS, and any native library Netty may unpack -- was
+        # never exercised without /tmp, because the throwaway pod had no job to
+        # deliver. An emptyDir costs nothing, and removing it would trade a free
+        # line for an untested failure mode on the one code path that matters.
+        #
+        # ⚠️ Stated plainly rather than dressed up as a requirement: this is cheap
+        # insurance against something unmeasured, not a proven necessity.
+        - name: tmp
+          mountPath: /tmp
+
+      volumes:
+      - name: tmp
+        emptyDir: {}
