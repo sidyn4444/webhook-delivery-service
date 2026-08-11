@@ -31,10 +31,29 @@ spec:
   # request capacity left the second pod sits Pending forever and the Deployment
   # reports 1/2. Nothing forces it on.
   #
-  # ⚠️ The HPA takes ownership of this number at 22a. Once it does, editing
-  # `replicas` here and re-applying fights the autoscaler.
+  # 🔴 SO WHERE IS `replicas`? DELETED ON PURPOSE AT 22a, AND THE FIELD BEING
+  # ABSENT IS THE POINT. 07-producer-hpa.yaml now OWNS this number, and
+  # "owns" turned out to be literal -- measured:
+  #
+  #     replicas BEFORE apply: 4          <- the HPA had scaled up under load
+  #     kubectl apply -f 05-producer.yaml -> deployment.apps/producer configured
+  #     replicas AFTER apply:  2          <- the manifest silently won
+  #
+  # A hardcoded `replicas` here does not coexist with an autoscaler, it FIGHTS
+  # it: every `kubectl apply -f k8s/local/` resets the count to the literal in
+  # this file and the HPA scales it back up ~15s later. Nothing errors. The tell
+  # is `configured` where you expected `unchanged` -- which is also why 21d
+  # chased the cpu "1" vs "1000m" normalisation, because once every apply prints
+  # `configured` you can no longer see a real change.
+  #
+  # ⚠️ The consequence to know for a cold `minikube start` (24a): with no
+  # `replicas` field and no HPA yet, the Deployment takes the API default of ONE
+  # replica. The HPA's minReplicas: 2 restores the second one within seconds of
+  # being applied. Briefly 1, then 2 -- correct, and it looks wrong.
+  #
+  # The floor and ceiling now live in the HPA, which is the honest place for
+  # them: minReplicas: 2 (availability) and maxReplicas: 4 (node capacity).
   # ---------------------------------------------------------------------------
-  replicas: 2
 
   # RollingUpdate (the default) is CORRECT here and was wrong for the datastores
   # at 21c. Two producers briefly overlapping is harmless -- they are stateless
@@ -139,17 +158,38 @@ spec:
         # delay on every restart.
         #
         # A startupProbe replaces that guess with a BUDGET: check every 2s, allow
-        # up to 15 failures = 30s to boot, then hand over. The producer boots in
-        # ~1.7s, so 30s is generous on purpose -- a cold node under load is much
-        # slower than a warm laptop, and the cost of a generous budget is only
-        # paid when something is actually broken.
+        # up to N failures, then hand over.
+        #
+        # 🔴 THIS BUDGET WAS 30s AND IT WAS MEASURED TOO SMALL AT 22a. The number
+        # was calibrated against a ~1.7s boot on an IDLE node -- roughly 17x
+        # headroom, which looked generous. Then the node went NotReady for ~12s,
+        # every pod in the namespace cold-started at the same moment, and five
+        # JVMs contended for four cores. Measured from the container's own log:
+        #
+        #     idle node       Started ProducerApplication in 1.7s
+        #     contended       Root WebApplicationContext init alone = 19,470 ms,
+        #                     Tomcat still had not bound port 8080 at 30s
+        #
+        # So the probe killed an application that was starting CORRECTLY. And
+        # the kill is not neutral -- the replacement is another cold JVM start,
+        # which adds contention, which pushes the next pod over the same budget.
+        # Producers reached 5 restarts and workers 4 before it was broken by
+        # hand. 🔴 A startup budget that is too small does not fail once; it
+        # becomes a self-sustaining spiral, because its own remedy is the thing
+        # causing the load.
+        #
+        # 90s, and the asymmetry is the argument: a startupProbe runs ONCE per
+        # container start, so a generous budget costs only a slower verdict on
+        # an app that is genuinely broken. A tight budget costs an outage that
+        # sustains itself. Calibrate a startup budget against the CONTENDED
+        # boot -- the idle boot is the case that never needed the probe.
         # -------------------------------------------------------------------
         startupProbe:
           httpGet:
             path: /actuator/health/liveness
             port: http
           periodSeconds: 2
-          failureThreshold: 15      # 15 x 2s = 30s to finish starting
+          failureThreshold: 45      # 45 x 2s = 90s to finish starting
           timeoutSeconds: 3
 
         # -------------------------------------------------------------------

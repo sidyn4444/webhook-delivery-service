@@ -132,14 +132,27 @@ spec:
         # bind its port until the database schema has been checked or created.
         # With three replicas booting at once, three Flyway instances contend for
         # the same migration lock, so one of them waits for the others.
-        # 3s x 20 = 60s. The producer needed 30s and has no database at all.
+        #
+        # 🔴 RAISED 60s -> 150s AT 22a, for the reason written up in full in
+        # 05-producer.yaml: a node blip cold-started every pod at once, five JVMs
+        # contended for four cores, and boots that normally take ~2s took 15-19s+
+        # -- so the startup probe began killing applications that were starting
+        # correctly, and each kill added another cold boot. These workers hit
+        # 4 restarts each. The budget must cover the CONTENDED boot; the idle
+        # boot is the case that never needed a probe.
+        #
+        # It stays LARGER than the producer's 90s because this app does strictly
+        # more work before it can bind a port: Flyway connects and checks the
+        # schema during context initialisation, and with three replicas booting
+        # together two of them wait on the migration lock the third holds.
+        # 3s x 50 = 150s.
         # -------------------------------------------------------------------
         startupProbe:
           httpGet:
             path: /actuator/health/liveness
             port: mgmt
           periodSeconds: 3
-          failureThreshold: 20             # 20 x 3s = 60s to migrate and boot
+          failureThreshold: 50             # 50 x 3s = 150s to migrate and boot
           timeoutSeconds: 3
 
         # -------------------------------------------------------------------
