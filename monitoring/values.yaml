@@ -1,0 +1,164 @@
+# Helm values for prometheus-community/kube-prometheus-stack
+#
+# Installed with:
+#   helm install monitoring prometheus-community/kube-prometheus-stack \
+#     -n monitoring --create-namespace --version 88.2.0 -f monitoring/values.yaml
+#
+# LOCAL DEV ONLY. This is sized for a minikube node running inside a 4.5 GB Docker VM
+# on an 8 GB laptop, alongside the application itself. It is not a production posture.
+#
+# Everything switched off below is switched off for a stated reason, not to save typing.
+
+# ---------------------------------------------------------------------------
+# Alertmanager: OFF.
+#
+# There is nowhere for an alert to go on a laptop — no email, no pager, no Slack.
+# Running it would cost memory to deliver notifications to nobody.
+#
+# The honest consequence, and it is worth stating rather than hiding: this stack
+# is DASHBOARDS ONLY. A dashboard shows you; an alert rule tells you. Nothing here
+# will ever wake anyone up.
+# ---------------------------------------------------------------------------
+alertmanager:
+  enabled: false
+
+# ---------------------------------------------------------------------------
+# The chart's ~100 built-in alerting rules: OFF.
+#
+# They exist to fire into Alertmanager, which is disabled. Prometheus evaluates
+# every rule on a timer whether or not anything consumes the result, so leaving
+# them on would burn CPU on this node continuously to produce alerts with no
+# destination — and this node's CPU is exactly what went wrong at 22a.
+# ---------------------------------------------------------------------------
+defaultRules:
+  create: false
+
+# ---------------------------------------------------------------------------
+# Control-plane scrape jobs: OFF.
+#
+# minikube runs kube-controller-manager, kube-scheduler, etcd and kube-proxy bound
+# to addresses a scraper cannot reach, so these targets would sit permanently DOWN.
+#
+# This is NOT hiding a failure — it is refusing to install four red lights that can
+# never turn green. A permanently-failing check trains you to ignore red, which
+# costs more than the check was ever worth.
+#
+# On a real cluster (EKS, Session 5) these are reachable and would be left enabled.
+# ---------------------------------------------------------------------------
+kubeControllerManager:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeEtcd:
+  enabled: false
+kubeProxy:
+  enabled: false
+
+# ---------------------------------------------------------------------------
+# The operator itself — the component that watches for ServiceMonitor / PodMonitor
+# objects and regenerates Prometheus's configuration from them.
+# ---------------------------------------------------------------------------
+prometheusOperator:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 96Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+
+prometheus:
+  prometheusSpec:
+    # 6 hours of history. Long enough to answer "did that spike just now?" and short
+    # enough that an emptyDir holds it comfortably. Production would be days, on a
+    # PersistentVolume or remote storage.
+    retention: 6h
+    scrapeInterval: 30s
+    evaluationInterval: 30s
+
+    # 🔴 THE SETTING THAT MAKES OUR OWN APPS DISCOVERABLE.
+    #
+    # By default this chart configures Prometheus to select ONLY monitors carrying
+    # `release: monitoring`. A ServiceMonitor without that label is silently ignored —
+    # no error, no warning, the target simply never appears.
+    #
+    # Setting these to false means "select every ServiceMonitor/PodMonitor in every
+    # namespace." Chosen so our application manifests do not have to name the Helm
+    # release they happen to be monitored by — k8s/local/ stays independent of how
+    # monitoring was installed.
+    #
+    # Cost, stated: on a shared cluster this makes Prometheus pick up anything anyone
+    # creates. Correct there would be the label selector; correct here is decoupling.
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+    probeSelectorNilUsesHelmValues: false
+    scrapeConfigSelectorNilUsesHelmValues: false
+
+    # No storageSpec => emptyDir. Deliberate, and the same trade as the in-cluster
+    # Postgres at 21c: deleting this pod erases the metric history. Acceptable on a
+    # laptop; production is a PersistentVolume or remote write.
+    resources:
+      requests:
+        cpu: 100m
+        memory: 400Mi
+      limits:
+        cpu: 1000m
+        memory: 700Mi
+
+grafana:
+  # Left at the chart's default admin password (`prom-operator`). Acceptable ONLY
+  # because Grafana is a ClusterIP with no Ingress — unreachable without an explicit
+  # kubectl port-forward from this laptop. It is not a secret we chose or committed.
+  persistence:
+    enabled: false
+
+  # ⚠️ MEASURED, NOT GUESSED. The first version of this file set the limit to 256Mi
+  # and the container settled at 255Mi — one allocation from OOMKilled, and it would
+  # have died quietly at some point overnight rather than at install time.
+  # 384Mi is the measured steady state plus headroom.
+  resources:
+    requests:
+      cpu: 50m
+      memory: 288Mi
+    limits:
+      cpu: 300m
+      memory: 384Mi
+
+  # 🔴 The Grafana pod runs THREE containers: grafana plus two sidecars that load the
+  # dashboards and datasources from ConfigMaps. `grafana.resources` above applies only
+  # to the main container — the chart gives the sidecars NOTHING, so they were running
+  # with no request and no limit while using ~146Mi between them.
+  #
+  # An absent request is counted as roughly zero by the scheduler, so those 146Mi were
+  # invisible when Kubernetes decided this pod fit on the node. Setting them makes the
+  # arithmetic honest, which is the whole point of a request.
+  sidecar:
+    resources:
+      requests:
+        cpu: 10m
+        memory: 80Mi
+      limits:
+        cpu: 100m
+        memory: 160Mi
+
+# Reports the state of Kubernetes objects themselves — how many replicas a Deployment
+# wants versus has, pod phases, restart counts.
+kube-state-metrics:
+  resources:
+    requests:
+      cpu: 20m
+      memory: 64Mi
+    limits:
+      cpu: 100m
+      memory: 128Mi
+
+# Reports the machine: CPU, memory, disk, network. Runs as a DaemonSet, so one per node.
+prometheus-node-exporter:
+  resources:
+    requests:
+      cpu: 20m
+      memory: 32Mi
+    limits:
+      cpu: 100m
+      memory: 64Mi
