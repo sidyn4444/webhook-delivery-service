@@ -72,6 +72,25 @@
         </dependency>
 
         <!--
+            WHY: same as the producer — this is what makes /actuator/prometheus exist.
+            Micrometer is the vendor-neutral metrics API; this registry decides the
+            wire format. Actuator alone serves no metrics.
+
+            The worker serves it on 8081, the management-only port added at 19d. That
+            port was justified twice over at the time: probes now, a scrape target in
+            Week 6. This is the second half arriving — the port earns its keep again
+            without any new decision.
+
+            ⚠️ The dependency CREATES the endpoint; the exposure list in
+            application.properties is what PUBLISHES it. One without the other is a
+            404 with the library sitting right there.
+        -->
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-prometheus</artifactId>
+        </dependency>
+
+        <!--
             WHY: the worker's whole existence is reading jobs OFF the queue the
             producer fills. This brings Lettuce (the Redis client) plus Spring's
             StringRedisTemplate, and auto-configures the connection from the

@@ -49,6 +49,29 @@
         </dependency>
 
         <!--
+            WHY: this dependency is the entire reason /actuator/prometheus exists.
+            Actuator alone does NOT serve metrics in any format — Micrometer is a
+            vendor-neutral metrics API (the same shape as SLF4J for logging), and the
+            REGISTRY on the classpath decides the wire format. Swap this for the
+            Datadog or CloudWatch registry and no application code changes.
+
+            What it produces without a line of code: JVM heap and garbage collection,
+            thread counts, HTTP request counts and latency histograms, and connection
+            pool statistics. What it does NOT produce, ever: anything about webhooks,
+            queue depth or retries — nothing outside this codebase knows those exist.
+
+            ⚠️ The dependency CREATES the endpoint; it does not PUBLISH it. Actuator
+            only serves endpoints named in management.endpoints.web.exposure.include,
+            so without that properties change the library is present and the URL 404s.
+
+            NO <version> — managed by spring-boot-starter-parent.
+        -->
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-prometheus</artifactId>
+        </dependency>
+
+        <!--
             WHY: the producer's second job is putting jobs on the queue. This brings
             Lettuce (the Redis client) plus Spring's RedisTemplate/StringRedisTemplate
             wrapper, and auto-configures a connection from the spring.data.redis.*

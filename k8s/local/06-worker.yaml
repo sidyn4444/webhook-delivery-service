@@ -87,7 +87,7 @@ spec:
 
       containers:
       - name: worker
-        image: webhook-worker:0.1.0
+        image: webhook-worker:0.2.0
         imagePullPolicy: IfNotPresent      # the image is on the node (20b), not in a registry
 
         ports:

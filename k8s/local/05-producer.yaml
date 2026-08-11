@@ -62,8 +62,20 @@ spec:
   strategy:
     type: RollingUpdate
     rollingUpdate:
-      maxUnavailable: 0     # never drop below `replicas` during a rollout
-      maxSurge: 1           # add at most one extra pod while rolling
+      # ⚠️ CHANGED AT 23b, and the reason is the node rather than the app.
+      # This was maxUnavailable: 0 / maxSurge: 1 -- never drop below `replicas`,
+      # add one extra while rolling. That is the right shape for a stateless front
+      # door and it is the wrong shape for THIS node: memory requests sit at 4162Mi
+      # against Docker's real 4500Mi cap, and a surge pod adds another 512Mi request
+      # the scheduler would accept (it validates against the ADVERTISED 5924Mi -- 20a)
+      # and the machine cannot hold. That is precisely the condition 22a's restart
+      # storm grew out of.
+      #
+      # Replace-in-place instead. COST, STATED: one of two producers is briefly gone,
+      # so capacity halves for a few seconds during a deploy. On a real cluster with
+      # real headroom this goes back to maxSurge: 1.
+      maxUnavailable: 1
+      maxSurge: 0
 
   selector:
     matchLabels:
@@ -109,7 +121,7 @@ spec:
 
       containers:
       - name: producer
-        image: webhook-producer:0.1.0
+        image: webhook-producer:0.2.0
         # 🔴 IfNotPresent, not the default. With no explicit tag Kubernetes would
         # use Always and try to PULL from Docker Hub -- where this image does not
         # exist -- giving ImagePullBackOff for an image that is already on the
