@@ -79,8 +79,20 @@ public record Event(
          */
         @JsonProperty("subscriber_url")
         @NotBlank(message = "subscriber_url is required")
+        /*
+         * CASE_INSENSITIVE because RFC 3986 §3.1 says scheme names are case-insensitive:
+         * HTTPS://example.com and https://example.com are the same URL, and every HTTP client
+         * treats them that way. Without the flag this regex refuses an uppercase scheme with
+         * the message below — which reads as nonsense to a caller who did start with https://.
+         *
+         * That was an OVER-rejection, not a bypass: UrlSafety lowercases the scheme with
+         * Locale.ROOT before its allowlist check, so no hostile URL ever got through by
+         * changing case. Erring toward refusal is the safe direction for a gate to be wrong
+         * in, which is why this is a correctness fix and not a security one.
+         */
         @Pattern(
                 regexp = "^https?://.+",
+                flags = Pattern.Flag.CASE_INSENSITIVE,
                 message = "subscriber_url must start with http:// or https://"
         )
         String subscriberUrl,

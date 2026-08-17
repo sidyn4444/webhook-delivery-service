@@ -155,6 +155,42 @@ class EventControllerTest {
             assertThat(responseBody).doesNotContain("redis", "10.0.0.7", "RuntimeException");
         }
 
+        /*
+         * RFC 3986 §3.1: "scheme names are case-insensitive." HTTPS://example.com and
+         * https://example.com are the SAME URL, and every browser, curl and HTTP client treats
+         * them that way.
+         *
+         * The @Pattern on Event.subscriberUrl was case-SENSITIVE, so an uppercase scheme was
+         * refused with 400 "subscriber_url must start with http:// or https://" — a message that
+         * is actively confusing, because the caller did exactly that.
+         *
+         * Worth being precise about what kind of bug this is: it is an OVER-rejection, not a
+         * bypass. The SSRF gate one layer down already lowercases with Locale.ROOT before
+         * comparing, so nothing hostile ever got through by changing case. A validator that errs
+         * toward refusing is wrong in the safe direction — which is why this was a correctness
+         * fix rather than a security one.
+         *
+         * A mixed-case entry is included deliberately: "HTTPS" alone would also pass a naive fix
+         * that just added a second all-caps alternative to the regex.
+         */
+        @ParameterizedTest(name = "{0} is accepted")
+        @ValueSource(strings = {
+                "HTTPS://8.8.8.8/webhooks",
+                "HTTP://8.8.8.8/webhooks",
+                "HtTpS://8.8.8.8/webhooks"
+        })
+        @DisplayName("🔴 an uppercase or mixed-case scheme is ACCEPTED — schemes are case-insensitive")
+        void aCaseInsensitiveSchemeIsAccepted(String url) throws Exception {
+            mockMvc.perform(post("/events")
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content(body(VALID_ID, url, "hello")))
+                    .andExpect(status().isAccepted());
+
+            // The pair, as everywhere else in this file: accepted AND actually queued. A 202 that
+            // enqueued nothing would be a worse bug than the 400 this replaces.
+            verify(queueService, times(1)).enqueue(any(Event.class));
+        }
+
         @Test
         @DisplayName("a 2xx-only check would miss it: 202 exactly, not 200 or 201")
         void theStatusIsPrecisely202() throws Exception {
