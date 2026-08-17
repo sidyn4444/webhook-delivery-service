@@ -1,0 +1,288 @@
+# =============================================================================
+#  cluster.yaml -- the entire EKS cluster, as one file.
+#
+#      eksctl create cluster -f deploy/cluster.yaml --dry-run   # validate, free
+#      eksctl create cluster -f deploy/cluster.yaml             # ~$5.50/day
+#
+#  WHY A FILE AND NOT FLAGS
+#
+#  `eksctl create cluster --name webhook-eks --nodes 2` builds identical
+#  infrastructure and records NOTHING. Terraform is out of scope for this
+#  project (see docs/PROJECT_BRIEF.md), so this file is the only description of
+#  what the network actually is. It is also diffable and reviewable; a flags
+#  command exists only in shell history.
+#
+#  🔴 AWS NEVER SEES THIS FILE. eksctl reads it locally, works out the ~20 AWS
+#  resources it implies, and makes the API calls itself via CloudFormation. If
+#  this file is lost, nothing in AWS remembers it.
+#
+#  NAMING IS A CONTRACT, NOT A PREFERENCE. Every name below is already written
+#  into deploy/teardown.sh, which was deliberately authored BEFORE any of this
+#  existed. A cluster called anything other than `webhook-eks` is a cluster the
+#  teardown sweep walks straight past while it bills.
+# =============================================================================
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: webhook-eks
+  region: us-east-1
+
+  # ---------------------------------------------------------------------------
+  # 🔴 THE VERSION IS A COST DECISION, NOT A TASTE ONE.
+  #
+  # AWS supports each Kubernetes version for roughly a year (STANDARD support),
+  # then keeps it alive under EXTENDED support at ~$0.60/hour instead of ~$0.10
+  # -- SIX TIMES the control-plane price -- and enrols you automatically, with
+  # no prompt and no warning email.
+  #
+  # Checked against the API rather than assumed, on 2026-08-12:
+  #
+  #     1.36  standard until 2027-08-01   (AWS default)
+  #     1.35  standard until 2027-03-26
+  #     1.34  standard until 2026-12-01   <-- chosen
+  #     1.33  EXPIRED 2026-07-28          <-- 15 days ago
+  #     1.32  EXPIRED
+  #     1.31  EXPIRED
+  #
+  # ⚠️ docs/PROJECT_BRIEF.md pins "Kubernetes 1.30". That was correct when the
+  # brief was written and is now not merely stale but expensive -- 1.30 is no
+  # longer offered at all.
+  #
+  # 1.34 over the 1.36 default deliberately: standard support runs past the end
+  # of this project and past interview season, and being two releases behind the
+  # default means every Helm chart and controller version pinned in Session 4 is
+  # certainly compatible. Nothing here benefits from being current.
+  # ---------------------------------------------------------------------------
+  version: "1.34"
+
+  # Applied to the CloudFormation stacks and propagated to what they create.
+  # 🔴 teardown.sh step 5 sweeps EC2 instances BY THIS TAG and by nothing else --
+  # scoped deliberately, so the script can never destroy something unrelated
+  # this account may later hold. If the tag fails to propagate, that sweep is
+  # blind while still printing green. 26c verifies it landed.
+  tags:
+    Project: webhook-delivery
+
+# -----------------------------------------------------------------------------
+#  THE AVAILABILITY ZONES.
+#
+#  An AZ is a physically separate datacentre -- own power, own cooling, own
+#  network. EKS REFUSES to create a cluster with fewer than two, because the
+#  control plane AWS runs on your behalf is itself spread across them.
+#
+#  ⚠️ PINNED BY NAME RATHER THAN LEFT TO eksctl. us-east-1e has a long history
+#  of not supporting newer instance types and of running out of capacity. If
+#  eksctl picks it at random the failure is `InsufficientInstanceCapacity` or
+#  `Unsupported` -- arriving AFTER the control plane exists and has started
+#  billing.
+# -----------------------------------------------------------------------------
+availabilityZones:
+  - us-east-1a
+  - us-east-1b
+
+# -----------------------------------------------------------------------------
+#  THE NETWORK.
+#
+#  eksctl builds a VPC with FOUR subnets from this: one public and one private
+#  in each AZ. The split is the security posture of the whole project.
+#
+#    PRIVATE  no route from the internet. Nothing here has a public address at
+#             all. ALL NODES GO HERE -- there is no "producer node" and no
+#             "worker node"; there are two identical machines and the scheduler
+#             decides which pods land on which.
+#
+#    PUBLIC   reachable from the internet. NOTHING OF OURS RUNS HERE. These
+#             exist for two things: the NAT Gateway below, and the ALB that
+#             Task 30 will place into them.
+#
+#  🔴 The distinction is a ROUTE, not a firewall. A security group is a rule
+#  that can be written wrongly; a missing route is not a rule. There is no
+#  misconfiguration that accidentally puts a private-subnet machine on the
+#  internet -- you would have to deliberately add an internet gateway route.
+#  That is why "the database is in a private subnet" is a stronger claim than
+#  "the database has a security group", and it is defence in depth: the SG is
+#  the lock, the private subnet is the absent door.
+# -----------------------------------------------------------------------------
+vpc:
+  cidr: "10.0.0.0/16"
+
+  # ---------------------------------------------------------------------------
+  # 💰 THE NAT GATEWAY -- the surprise line on every first AWS bill.
+  #
+  # Private nodes still need to reach OUT: pull images from ECR, POST a webhook
+  # to a subscriber, call the EKS API. A NAT Gateway is the one-way door that
+  # allows outbound connections while nothing outside can use it to start one
+  # inbound.
+  #
+  # ~$0.045/hour == ~$1.10/day, PLUS per-GB. It bills at zero traffic. It is
+  # created BY eksctl rather than by us, which is precisely why it is the thing
+  # a cleanup misses -- your mental inventory is a list of things you made.
+  #
+  # THE FORK, both directions:
+  #   Single           1 gateway,  ~$1.10/day. If that AZ fails, the OTHER AZ's
+  #                    nodes lose outbound. Single point of failure, stated.
+  #   HighlyAvailable  1 per AZ,   ~$3.30/day. Survives an AZ outage.
+  #
+  # Single, chosen: this cluster lives in hourly stretches, and an AZ failure
+  # would already have taken half a two-AZ node group with it. The honest
+  # sentence costs less than $2/day.
+  #
+  # ⚠️ `Disable` exists and would be free -- and would break the system. Pods
+  # could not pull from ECR and workers could not deliver a single webhook. The
+  # symptom is a pod hanging at startup with what looks like a DNS failure.
+  # ---------------------------------------------------------------------------
+  nat:
+    gateway: Single
+
+  # Public access so kubectl works from this laptop; private access so the nodes
+  # reach the API server over the VPC rather than out through the NAT Gateway
+  # and back in -- which would work, and would bill per GB for the privilege.
+  clusterEndpoints:
+    publicAccess: true
+    privateAccess: true
+
+# -----------------------------------------------------------------------------
+#  IAM.
+#
+#  🔴 withOIDC REGISTERS THE CLUSTER AS AN IDENTITY PROVIDER WITH AWS -- the
+#  first link in the IRSA chain, and Task 30 cannot install the AWS Load
+#  Balancer Controller without it.
+#
+#  It is FREE, and doing it here is one line instead of a separate
+#  `eksctl utils associate-iam-oidc-provider` run later. Once it exists, an IAM
+#  role's trust policy can name a Kubernetes service account, and a pod using
+#  that service account receives temporary AWS credentials with no access key
+#  stored anywhere.
+# -----------------------------------------------------------------------------
+iam:
+  withOIDC: true
+
+# -----------------------------------------------------------------------------
+#  THE NODES.
+#
+#  `managedNodeGroups`, not `nodeGroups`. Managed means AWS owns the lifecycle:
+#  AMI updates, cordon-and-drain on replacement, and node health remediation.
+#  Unmanaged groups are plain autoscaling groups and are effectively legacy.
+# -----------------------------------------------------------------------------
+managedNodeGroups:
+  - name: webhook-nodes
+
+    # -------------------------------------------------------------------------
+    # 🔴 SIZE DERIVED FROM MEASURED REQUESTS, NOT FROM A FAMILIAR INSTANCE TYPE.
+    #
+    # The pod sizes were fixed in Session 4 and are NOT decided here -- 512Mi
+    # requests are already written into k8s/local/05-producer.yaml and
+    # 06-worker.yaml. This is the other direction: given fixed pods, how big a
+    # machine holds them?
+    #
+    # WHAT MUST FIT (Redis and Postgres leave the cluster at Task 27):
+    #     producer   2-4 x 512Mi  ->  2048Mi at HPA max      400m
+    #     worker     3   x 512Mi  ->  1536Mi                 300m
+    #     monitoring (Session 6, read out of monitoring/values.yaml)
+    #       prometheus 400Mi . grafana+sidecars 448Mi
+    #       operator    96Mi . kube-state-metrics 64Mi       240m
+    #     EKS's own    coredns x2 + aws-node + kube-proxy     ~450m / 140Mi
+    #     ------------------------------------------------------------------
+    #     PEAK        ~4.8 GiB                               ~1.43 vCPU
+    #
+    # WHAT A NODE ACTUALLY GIVES YOU is not its spec sheet. EKS reserves memory
+    # by formula -- 255Mi + (11Mi x maxPods); maxPods on t3.medium is 17, so
+    # 442Mi -- plus a 100Mi eviction threshold. A 4 GiB t3.medium therefore
+    # yields roughly 3.5 GiB ALLOCATABLE, and ~1930m of its 2000m CPU.
+    #
+    #     2 x t3.small    ~3.1 GiB   REJECTED -- less than the 4.8 GiB already
+    #                                promised. Pods would sit Pending, not fail.
+    #     2 x t3.medium   ~7.0 GiB   68% memory / 37% CPU at peak.  ~$2/day
+    #     3 x t3.medium  ~10.5 GiB   45% idle, +$1/day
+    #     1 x t3.large    ~7.0 GiB   same capacity, zero HA, and two AZs are
+    #                                mandatory anyway
+    #
+    # ⚠️ THE HONEST BOUNDARY, because totals lie and the scheduler packs PER
+    # NODE. Worst case one node holds 4 producers (2048Mi) + the whole
+    # monitoring stack (1008Mi) + coredns and node-exporter (~170Mi) = 3226Mi
+    # against ~3500Mi allocatable. 92%. It fits; it is not comfortable. If
+    # Session 6 produces Pending pods the lever is HPA maxReplicas 4->3, or
+    # maxSize below makes a third node one command rather than a cluster edit.
+    #
+    # ⚠️ These allocatable figures are a PREDICTION FROM THE FORMULA. 26c reads
+    # the real numbers off `kubectl describe node` and compares. Deriving the
+    # expected value before measuring is what makes that a test rather than a
+    # reading.
+    #
+    # ⚠️ t3 is BURSTABLE: ~20% of 2 vCPU sustained, banking credits otherwise.
+    # In `unlimited` mode (the t3 default) it does not throttle -- it charges
+    # for surplus CPU. Session 6's load-test numbers are only defensible if this
+    # is known, so 26c reads the credit specification off the running instances.
+    # -------------------------------------------------------------------------
+    instanceType: t3.medium
+    desiredCapacity: 2
+    minSize: 2
+    # maxSize 3, not 2: no Cluster Autoscaler is installed, so this bound does
+    # nothing on its own -- it is what makes `eksctl scale nodegroup` to 3 a
+    # one-liner if Session 6's packing gets tight. A bound you cannot reach in
+    # an emergency is not a bound.
+    maxSize: 3
+
+    # 🔴 THE LINE THAT PUTS THE NODES IN THE PRIVATE SUBNETS. Without it eksctl
+    # places them in the public ones and gives each a public IP -- and the
+    # cluster works IDENTICALLY either way. Pods run, the API answers, nothing
+    # anywhere reports a problem. The only observable difference is the
+    # EXTERNAL-IP column of `kubectl get nodes -o wide`, which is exactly why
+    # 26c checks it: this is a claim with no natural symptom when false.
+    privateNetworking: true
+
+    # 20 GiB gp3, not eksctl's default 80 GiB gp2. The node disk holds the OS
+    # and container images; our distroless images are ~250 MB each. 80 GiB x 2
+    # nodes is ~$0.43/day of EBS for a disk that sits 90% empty -- and EBS bills
+    # even while an instance is stopped. gp3 is cheaper per GB than gp2 and has
+    # baseline performance that does not depend on volume size.
+    volumeSize: 20
+    volumeType: gp3
+
+    # Pinned rather than defaulted, so a re-create months from now produces the
+    # same node OS rather than silently following whatever AWS has moved on to.
+    amiFamily: AmazonLinux2023
+
+    # Blocks the legacy instance-metadata endpoint. IMDSv1 is the mechanism
+    # behind classic SSRF-to-cloud-credential attacks -- a request to
+    # 169.254.169.254 returns the node's IAM credentials with no token exchange.
+    # This project's producer explicitly blocks that address in its SSRF gate
+    # (3b); disabling v1 closes the same hole one layer lower down.
+    disableIMDSv1: true
+
+    labels:
+      role: webhook-workload
+
+    tags:
+      Project: webhook-delivery
+
+    # eksctl attaches the three policies a node cannot function without:
+    # AmazonEKSWorkerNodePolicy, AmazonEKS_CNI_Policy, and
+    # AmazonEC2ContainerRegistryReadOnly -- the last being what lets Task 28's
+    # nodes pull our images from ECR without any credential in the cluster.
+    # Nothing extra is added here: the AWS Load Balancer Controller gets its own
+    # role via IRSA in Task 30 rather than borrowing the node's.
+
+# -----------------------------------------------------------------------------
+#  DELIBERATELY ABSENT, each with the trigger that would change the decision.
+#
+#  cloudWatch.clusterLogging   Control-plane logs to CloudWatch at $0.50/GB
+#                              ingested. Off. Turn on when debugging an API
+#                              server or admission problem, then turn it off.
+#
+#  EBS CSI driver              Nothing here needs a PersistentVolume:
+#                              monitoring/values.yaml puts Prometheus on an
+#                              emptyDir, and Postgres becomes RDS at 27b.
+#                              Trigger: wanting metric history to survive a pod
+#                              restart.
+#
+#  Cluster Autoscaler / Karpenter  Node count is fixed at 2. Trigger: load that
+#                              cannot be served by maxSize 3.
+#
+#  Explicit `addons:` block    vpc-cni, coredns and kube-proxy are installed
+#                              automatically at versions matched to 1.34.
+#                              Pinning them adds a second thing to keep in step
+#                              with the control-plane version for no benefit at
+#                              this scale.
+# =============================================================================
