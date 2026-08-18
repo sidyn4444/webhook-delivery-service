@@ -22,7 +22,28 @@
 #  multi-architecture (linux/amd64 + linux/arm64/v8), so the same file works
 #  for local builds and for Week 5's cross-build.
 #  `AS build` names the stage so stage 2 can copy out of it by name.
-FROM maven:3.9-eclipse-temurin-21 AS build
+#
+# 🔴 --platform=$BUILDPLATFORM PINS THIS STAGE TO THE MACHINE DOING THE BUILDING,
+#  NOT TO THE MACHINE THE IMAGE IS FOR. Added at 28b.
+#
+#  $BUILDPLATFORM is a variable buildx sets automatically: the builder's own
+#  architecture (linux/arm64 on this laptop). $TARGETPLATFORM is what --platform
+#  on the command line asked for (linux/amd64, because the EKS nodes are x86_64).
+#  Without this line, BOTH stages are built for the target, so Maven, the JDK and
+#  the whole dependency resolution run under QEMU emulation — measured elsewhere at
+#  5-15 minutes per image instead of about one.
+#
+#  🔴 THIS IS ONLY SAFE BECAUSE JAVA BYTECODE IS ARCHITECTURE-INDEPENDENT. The JAR
+#  that comes out of an arm64 Maven is byte-for-byte usable on x86_64 — there is no
+#  native compilation step whose output would be wrong. Stage 2 still runs as
+#  $TARGETPLATFORM, so the JRE, the libc and every native library in the runtime
+#  image are genuinely amd64.
+#
+#  ⚠️ THE BOUNDARY: this trick would be WRONG for a language that compiles to native
+#  code (Go without CROSS-compilation flags, Rust, C), and wrong for any Java project
+#  with a JNI dependency or a native-image/GraalVM step, because then the build stage
+#  really is producing architecture-specific output.
+FROM --platform=$BUILDPLATFORM maven:3.9-eclipse-temurin-21 AS build
 
 WORKDIR /build
 

@@ -22,7 +22,13 @@
 # -------------------------------------------------------------
 #  STAGE 1 — build the JAR
 # -------------------------------------------------------------
-FROM maven:3.9-eclipse-temurin-21 AS build
+# 🔴 --platform=$BUILDPLATFORM PINS THIS STAGE TO THE MACHINE DOING THE BUILDING,
+#  NOT TO THE MACHINE THE IMAGE IS FOR. Added at 28b. Same reasoning as
+#  Dockerfile.producer, where it is explained in full: Maven runs natively on the
+#  arm64 laptop, stage 2 runs as the amd64 target, and this is only safe because
+#  Java bytecode is architecture-independent. It would be wrong for Go, Rust, C, or
+#  any Java build with a JNI or GraalVM native-image step.
+FROM --platform=$BUILDPLATFORM maven:3.9-eclipse-temurin-21 AS build
 
 WORKDIR /build
 
