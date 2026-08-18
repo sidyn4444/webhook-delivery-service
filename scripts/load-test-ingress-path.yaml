@@ -1,0 +1,59 @@
+# ---------------------------------------------------------------------------
+#  A public path to the load-test receiver. TEST FIXTURE, not part of the app.
+#
+#  🔴 WHY THE RECEIVER HAS TO BE PUBLIC, AND IT IS THE SSRF GATE'S DOING.
+#
+#  The obvious setup is to point subscribers at the in-cluster Service. That is
+#  IMPOSSIBLE here, and correctly so: the producer's SSRF gate resolves every
+#  subscriber URL and refuses private ranges. Verified live on EKS at 35a --
+#
+#      http://loadtest-receiver.webhooks.svc.cluster.local/  -> 400
+#      http://172.20.160.50/                                 -> 400   (ClusterIP)
+#      http://169.254.169.254/latest/meta-data/              -> 400   (AWS metadata)
+#      https://httpbin.org/post                              -> 202   (control)
+#
+#  The security control this project advertises blocks its own test rig, which is
+#  the correct outcome and is worth more than the convenience it costs.
+#
+#  ⚠️ SO THE DELIVERY PATH IS: worker (private subnet) -> NAT Gateway -> internet
+#  -> ALB (public subnet) -> receiver pod. That hairpin is a real round trip and
+#  it INFLATES the measured latency relative to a same-cluster hop.
+#
+#  🔴 That is the honest choice rather than a compromise: a real subscriber IS
+#  across the internet, so a number measured over a genuine network round trip is
+#  MORE representative than one measured over loopback. What this avoids is the
+#  third party -- httpbin.org rate-limits and has latency we neither control nor
+#  can characterise, and publishing its p95 as ours would be false.
+#
+#  ⚠️ THIS GETS ITS OWN ALB rather than joining the production one. Sharing would
+#  require adding a matching `group.name` to k8s/eks/10-ingress.yaml -- editing the
+#  production front door to accommodate a test fixture, and recreating the ALB that
+#  Task 33 just verified. A second ALB costs ~$0.53/DAY (~$0.04 for this session)
+#  and is deleted with this file. That is the cheaper mistake.
+#
+#  HTTP only and NO host rule, deliberately: the subscriber URL is then the ALB's
+#  own `*.elb.amazonaws.com` name, which is PUBLIC (so the SSRF gate accepts it)
+#  and needs no ACM certificate and no Route 53 record.
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: loadtest-sink
+  namespace: webhooks
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
+    alb.ingress.kubernetes.io/load-balancer-name: webhook-sink-alb
+spec:
+  ingressClassName: alb
+  rules:
+  - http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: loadtest-receiver
+            port:
+              number: 80
