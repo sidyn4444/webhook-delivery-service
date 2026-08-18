@@ -1,0 +1,53 @@
+# =============================================================================
+#  PodMonitor — how Prometheus learns the workers exist.
+#
+#  🔴 WHY THIS IS A PodMonitor AND THE PRODUCER GETS A ServiceMonitor.
+#
+#  A ServiceMonitor selects SERVICES. The worker has none, deliberately (21e): a
+#  Service is a stable address so OTHER THINGS can call your pods, and nothing
+#  calls a worker -- it reaches into Redis and pulls. Creating a Service purely so
+#  a scraper could find it would undo a considered design decision for the
+#  scraper's convenience, and would leave a permanent object in the cluster whose
+#  only purpose is to be discovered.
+#
+#  A PodMonitor selects PODS directly and skips the Service entirely. It is the
+#  right tool for exactly this case: something worth measuring that nothing calls.
+#
+#  ⚠️ Worth knowing that this is not a workaround. Even for the producer, the
+#  ServiceMonitor causes Prometheus to scrape the POD IPs behind the Service, not
+#  the ClusterIP. The Service is only ever used to DISCOVER the pods. So the two
+#  objects differ in how targets are found and not at all in what is scraped.
+# =============================================================================
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: worker
+  namespace: webhooks
+  labels:
+    app: worker
+    app.kubernetes.io/part-of: webhook-delivery-service
+spec:
+  # A label query against PODS in this namespace -- matching the `app: worker`
+  # label set on the pod template in 06-worker.yaml.
+  selector:
+    matchLabels:
+      app: worker
+
+  namespaceSelector:
+    matchNames:
+    - webhooks
+
+  podMetricsEndpoints:
+  # 🔴 `port` here is the CONTAINER PORT NAME (`mgmt` in 06-worker.yaml, port
+  # 8081). That port exists because of 19d, which gave the worker a
+  # management-only HTTP port so the kubelet had something to ask -- and the
+  # decision was justified twice at the time: probes then, a scrape target in
+  # Week 6. This is the second half arriving, needing no new decision and no new
+  # port.
+  #
+  # ⚠️ It remains a HEALTH AND METRICS port, never a traffic port. Nothing routes
+  # application work here and nothing ever will.
+  - port: mgmt
+    path: /actuator/prometheus
+    interval: 30s
+    scheme: http

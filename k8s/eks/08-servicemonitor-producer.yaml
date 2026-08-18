@@ -1,0 +1,65 @@
+# =============================================================================
+#  ServiceMonitor — how Prometheus learns the producer exists.
+#
+#  🔴 THIS IS NOT A PROMETHEUS CONFIG FILE. Prometheus never reads it and has no
+#  idea the kind exists. The Prometheus OPERATOR watches for objects of this type,
+#  and when one appears it regenerates Prometheus's real scrape configuration and
+#  reloads it. That indirection is the operator pattern: you express what you want
+#  as an ordinary Kubernetes object, and a controller translates it into whatever
+#  the underlying tool actually needs.
+#
+#  The practical consequence: adding a service to monitoring is `kubectl apply` of
+#  a small file, not editing a config inside a running pod.
+#
+#  ⚠️ The CRD this depends on did not exist in this cluster until 23a. Applying
+#  this file before the Helm install fails with `no matches for kind ServiceMonitor`.
+#  Ordering between k8s/local/ and the Helm release is real, and it runs one way.
+# =============================================================================
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: producer
+  namespace: webhooks
+  labels:
+    app: producer
+    app.kubernetes.io/part-of: webhook-delivery-service
+spec:
+  # -------------------------------------------------------------------------
+  # WHICH SERVICE. This is a label query against Services in this namespace --
+  # the same shape as a Service's own selector over pods, one level up.
+  #
+  # ⚠️ A typo here matches nothing and produces NO ERROR. The object is created,
+  # the operator accepts it, and the target simply never appears in Prometheus.
+  # That is the same silent-failure shape as 21c's Service selector, so the check
+  # at 23c is to read the target list rather than to trust that this applied.
+  # -------------------------------------------------------------------------
+  selector:
+    matchLabels:
+      app: producer
+
+  # Restrict the search to this namespace. Without it the operator would look
+  # cluster-wide for any Service labelled `app: producer`.
+  namespaceSelector:
+    matchNames:
+    - webhooks
+
+  endpoints:
+  # 🔴 `port` here is the SERVICE PORT NAME (`http` in 05-producer.yaml), not a
+  # number and not the container port. Naming ports rather than numbering them is
+  # what lets this file survive a port change elsewhere.
+  - port: http
+    path: /actuator/prometheus
+    # 30s matches the stack-wide scrapeInterval in monitoring/values.yaml. Shorter
+    # means finer resolution and more load on both sides; a rate() over a 5-minute
+    # window needs several samples inside it, so this and any query window are
+    # coupled.
+    interval: 30s
+    scheme: http
+
+    # ⚠️ Prometheus scrapes the POD IPs behind this Service, NOT the Service's
+    # ClusterIP. That is deliberate and it is the whole value: with two producers
+    # you get two separate time series distinguished by a `pod` label, so "which
+    # replica is slow?" is answerable. Scraping through the ClusterIP would
+    # load-balance to a random pod each time and blend two machines into one
+    # meaningless average -- which is exactly the question 22a's 515m-vs-90m
+    # sibling-pod finding needed to ask and had no way to.
