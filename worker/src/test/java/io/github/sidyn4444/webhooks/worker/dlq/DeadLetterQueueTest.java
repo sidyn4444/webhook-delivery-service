@@ -27,6 +27,8 @@ import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 
 /**
  * Tests for {@link DeadLetterQueue}.
@@ -58,6 +60,7 @@ class DeadLetterQueueTest {
     @Mock private InFlightIndex inFlight;
 
     private DeadLetterQueue deadLetters;
+    private SimpleMeterRegistry meters;
 
     private static final String EVENT_ID = "3f2504e0-4f89-11d3-9a0c-0305e82c3301";
     private static final String ORIGINAL_JSON = "{\"event_id\":\"" + EVENT_ID + "\"}";
@@ -65,7 +68,8 @@ class DeadLetterQueueTest {
     @BeforeEach
     void setUp() {
         lenient().when(redis.opsForList()).thenReturn(listOps);
-        deadLetters = new DeadLetterQueue(redis, inFlight);
+        meters = new SimpleMeterRegistry();
+        deadLetters = new DeadLetterQueue(redis, inFlight, meters);
     }
 
     private DeliveryJob job() {
@@ -231,6 +235,70 @@ class DeadLetterQueueTest {
 
             assertThat(deadLetters.deadLetterUnparseable("not json", "bad shape")).isFalse();
             verify(listOps, never()).remove(anyString(), any(Long.class), anyString());
+        }
+    }
+
+    @Nested
+    @DisplayName("the dead-letter counter (32b)")
+    class TheCounter {
+
+        private double counted(String reason) {
+            Counter c = meters.find("webhook.dlq.entries").tag("reason", reason).counter();
+            return c == null ? 0 : c.count();
+        }
+
+        @Test
+        @DisplayName("counts one entry, tagged with the reason it was given")
+        void countsTaggedByReason() {
+            when(listOps.leftPush(eq(RedisKeys.DLQ), anyString())).thenReturn(1L);
+            when(listOps.remove(eq(RedisKeys.PROCESSING), eq(1L), anyString())).thenReturn(1L);
+
+            deadLetters.deadLetter(ORIGINAL_JSON, job(), DlqReason.RETRIES_EXHAUSTED, failed());
+
+            assertThat(counted("RETRIES_EXHAUSTED")).isEqualTo(1);
+
+            // The other two reasons must stay absent. A counter that incremented every tag would
+            // pass the assertion above, so the negative half is what gives it meaning.
+            assertThat(counted("NON_RETRIABLE_RESPONSE")).isZero();
+            assertThat(counted("UNPARSEABLE")).isZero();
+        }
+
+        @Test
+        @DisplayName("🔴 does NOT count when the DLQ write fails — the whole point of counting after the durability check")
+        void doesNotCountAnUnrecordedDeadLetter() {
+            // leftPush returning null is how StringRedisTemplate reports that the push did not
+            // happen, which is exactly the case `record` turns into an early `return false`.
+            when(listOps.leftPush(eq(RedisKeys.DLQ), anyString())).thenReturn(null);
+
+            boolean recorded = deadLetters.deadLetter(
+                    ORIGINAL_JSON, job(), DlqReason.RETRIES_EXHAUSTED, failed());
+
+            assertThat(recorded).isFalse();
+
+            // 🔴 THE REGRESSION THIS EXISTS TO CATCH. Moving the increment above the durability
+            // check is a one-line edit that no other test would notice, and it would make the
+            // metric report a healthy dead-letter rate at the exact moment jobs were being lost
+            // because Redis was failing — busiest when least true. It would also permanently
+            // desynchronise this counter from webhook.dlq.depth, destroying the reconciliation
+            // that made 32b's verification trustworthy.
+            assertThat(counted("RETRIES_EXHAUSTED")).isZero();
+        }
+
+        @Test
+        @DisplayName("an unparseable message counts under UNPARSEABLE, not under the parser's exception type")
+        void unparseableUsesTheEnumConstant() {
+            when(listOps.leftPush(eq(RedisKeys.DLQ), anyString())).thenReturn(1L);
+            when(listOps.remove(eq(RedisKeys.PROCESSING), eq(1L), anyString())).thenReturn(1L);
+
+            deadLetters.deadLetterUnparseable("not json {{{", "JsonParseException");
+
+            assertThat(counted("UNPARSEABLE")).isEqualTo(1);
+
+            // ⚠️ The parser's exception type must never become a label value — it is bounded by
+            // nothing a future codec or Jackson version might invent, which is the unbounded-label
+            // defect found at 32a in a smaller costume.
+            assertThat(meters.find("webhook.dlq.entries").tag("reason", "JsonParseException").counter())
+                    .isNull();
         }
     }
 }

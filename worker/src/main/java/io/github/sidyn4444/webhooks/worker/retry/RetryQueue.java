@@ -6,6 +6,8 @@ import io.github.sidyn4444.webhooks.common.queue.RedisKeys;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.core.io.ClassPathResource;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.stereotype.Component;
@@ -64,7 +66,38 @@ public class RetryQueue {
 
     private final StringRedisTemplate redis;
 
-    public RetryQueue(StringRedisTemplate redis) {
+    /**
+     * Counts retries scheduled — the metric that turns "we implemented exponential backoff" into a
+     * number.
+     *
+     * <p><b>Why this is worth an instrument of its own rather than being inferred.</b> It is tempting
+     * to derive the retry volume from the delivery timer: total attempts minus distinct events ought
+     * to be the retries. That arithmetic is wrong in both directions. It over-counts, because a
+     * reclaimed job re-delivered after a worker crash is a second attempt that was never a
+     * <i>retry</i> — nothing failed, a pod died. And it under-counts, because a scheduled retry that
+     * is still sitting on backoff has produced no attempt at all yet and so appears nowhere.
+     * <b>Deriving a domain number from transport metrics gives an answer that is confidently and
+     * unfalsifiably wrong, which is worse than having no answer.</b>
+     *
+     * <p>🔴 <b>The pairing to understand — and it is the same shape as the DLQ pair.</b>
+     * {@code webhook.retry.depth} is the gauge: <i>how many are waiting on backoff right now</i>.
+     * This counter is <i>how many were ever scheduled</i>. A retry set that is empty right now and a
+     * retry set that has never been used read <b>identically</b> on the gauge, and are opposite
+     * situations — one system is coping, the other has never been tested. Only the counter separates
+     * them, and it is the reason a "retries" panel needs both series.
+     *
+     * <p><b>Untagged, deliberately.</b> The obvious label is the attempt number, which would show the
+     * backoff ladder as a distribution — genuinely interesting. It is left out because it is bounded
+     * only by {@code maxRetries}, which lives on each job rather than in configuration (7b/12e), so
+     * a job enqueued under a different ceiling widens the label set with no code change. <b>A label
+     * whose value set is decided by data in flight is the 32a defect in a smaller costume.</b>
+     */
+    private final Counter retriesScheduled;
+
+    public RetryQueue(StringRedisTemplate redis, MeterRegistry registry) {
+        this.retriesScheduled = Counter.builder("webhook.retries.scheduled")
+                .description("Delivery attempts that failed and were scheduled for another try")
+                .register(registry);
         this.redis = redis;
     }
 
@@ -128,6 +161,21 @@ public class RetryQueue {
             log.info("Scheduled event {} attempt {} of {} for retry at {} (in {}ms)",
                     job.eventId(), job.attemptNumber(), job.maxRetries(), dueAt,
                     Math.max(0, dueAt.toEpochMilli() - System.currentTimeMillis()));
+
+            // 🔴 COUNTED ONLY ON THE newlyAdded PATH, AND THE BRANCH ABOVE IS THE REASON.
+            //
+            // A re-schedule of an attempt already sitting in the set updates its due time and
+            // returns true WITHOUT reaching here -- the sorted set collapses the two into one entry,
+            // which is the deduplication this class was built on. Counting there as well would
+            // report two retries where the system will perform exactly one, so the metric would
+            // over-state retry volume precisely when something upstream was scheduling duplicates.
+            //
+            // The counter therefore means "retries that will actually happen", which is the only
+            // version of the number that can be reconciled against webhook.retry.depth or against
+            // the attempt rows in Postgres. It is also placed after the Redis write and inside the
+            // try, so the catch below -- which deliberately returns false so the caller leaves the
+            // job parked in processing -- leaves it unincremented.
+            retriesScheduled.increment();
             return true;
 
         } catch (Exception e) {

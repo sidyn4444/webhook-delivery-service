@@ -24,6 +24,7 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.when;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 
 /**
  * Tests for {@link RetryQueue}.
@@ -63,7 +64,7 @@ class RetryQueueTest {
         // Called by each test rather than @BeforeEach, because the claimDue tests never touch
         // opsForZSet and strict stubbing would fail them for an unused stub.
         lenient().when(redis.opsForZSet()).thenReturn(zSetOps);
-        retryQueue = new RetryQueue(redis);
+        retryQueue = new RetryQueue(redis, new SimpleMeterRegistry());
     }
 
     private DeliveryJob job() {
@@ -165,7 +166,7 @@ class RetryQueueTest {
         @Test
         @DisplayName("a null result becomes an empty list, never a null")
         void nullBecomesEmptyList() {
-            retryQueue = new RetryQueue(redis);
+            retryQueue = new RetryQueue(redis, new SimpleMeterRegistry());
             when(redis.execute(any(RedisScript.class), anyList(), any(), any())).thenReturn(null);
 
             // The caller loops over this. Returning null would be a NullPointerException inside
@@ -177,7 +178,7 @@ class RetryQueueTest {
         @Test
         @DisplayName("a thrown exception becomes an empty list — the jobs stay scheduled")
         void anExceptionBecomesEmptyList() {
-            retryQueue = new RetryQueue(redis);
+            retryQueue = new RetryQueue(redis, new SimpleMeterRegistry());
             when(redis.execute(any(RedisScript.class), anyList(), any(), any()))
                     .thenThrow(new RuntimeException("script failed"));
 
@@ -190,7 +191,7 @@ class RetryQueueTest {
         @Test
         @DisplayName("promoted jobs are returned as they came back")
         void promotedJobsAreReturned() {
-            retryQueue = new RetryQueue(redis);
+            retryQueue = new RetryQueue(redis, new SimpleMeterRegistry());
             when(redis.execute(any(RedisScript.class), anyList(), any(), any()))
                     .thenReturn(List.of("{\"event_id\":\"a\"}", "{\"event_id\":\"b\"}"));
 

@@ -9,6 +9,8 @@ import io.github.sidyn4444.webhooks.worker.delivery.DeliveryResult;
 import io.github.sidyn4444.webhooks.worker.queue.InFlightIndex;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
 
@@ -77,7 +79,38 @@ public class DeadLetterQueue {
      */
     private final InFlightIndex inFlight;
 
-    public DeadLetterQueue(StringRedisTemplate redis, InFlightIndex inFlight) {
+    /**
+     * Counts jobs given up on, tagged by which road they took.
+     *
+     * <p><b>A counter and not a gauge, and the pairing with {@code webhook.dlq.depth} is the point.</b>
+     * The gauge answers <i>"how many are sitting there now?"</i> — the operational question, the one
+     * that decides whether someone has to look at it today. This counter answers <i>"how fast are we
+     * giving up?"</i>, which the gauge structurally cannot: a depth of 40 is the same reading whether
+     * it arrived over six months or in the last four minutes, and those are completely different
+     * incidents. Read through {@code rate()}, this one distinguishes them.
+     *
+     * <p>🔴 <b>And a counter survives the drain that would erase the gauge's history.</b> The moment
+     * anyone clears the dead-letter list after fixing something, the gauge returns to zero and every
+     * trace of the event is gone from it. The counter keeps climbing, because it records that the
+     * thing happened rather than that the evidence is still lying around. <b>A level and an
+     * accumulation are not two views of one number; each is blind to what the other sees.</b>
+     *
+     * <p>Tagged by {@link DlqReason}, which is safe to use as a label because it is an enum with three
+     * values — <b>bounded by our own code, not by anything a caller supplies.</b> That is the test
+     * every label has to pass after the cardinality defect found at 32a, and this one passes it for
+     * a structural reason rather than a hopeful one. The split earns its keep: {@code UNPARSEABLE} is
+     * a bug in <i>our</i> serialisation, {@code NON_RETRIABLE_RESPONSE} is the subscriber rejecting
+     * us outright, and {@code RETRIES_EXHAUSTED} is a subscriber that was simply down too long. Three
+     * different people fix those.
+     */
+    private final Counter.Builder deadLetteredCounter;
+
+    private final MeterRegistry registry;
+
+    public DeadLetterQueue(StringRedisTemplate redis, InFlightIndex inFlight, MeterRegistry registry) {
+        this.registry = registry;
+        this.deadLetteredCounter = Counter.builder("webhook.dlq.entries")
+                .description("Jobs permanently given up on, by reason");
         this.redis = redis;
         this.inFlight = inFlight;
     }
@@ -119,6 +152,19 @@ public class DeadLetterQueue {
         log.warn("DEAD-LETTERED event {} after {} attempt(s): {} (last: {})",
                 job.eventId(), job.attemptNumber(), reason, lastResult.describe());
 
+        // COUNTED AFTER THE DURABILITY CHECK, NEVER BEFORE IT.
+        //
+        // 🔴 The early return above means a failed write to Redis leaves this line unreached, so the
+        // counter records dead letters that were actually RECORDED rather than dead letters that were
+        // attempted. Those diverge in exactly the situation the metric is for: Redis in trouble.
+        // Counting on entry would report a tidy DLQ rate while jobs were being lost silently -- the
+        // metric would be busiest at the moment it was least true.
+        //
+        // ⚠️ It also keeps this counter reconcilable against `webhook.dlq.depth`. Two independent
+        // instruments over the same event only agree if they count the same thing, and a
+        // disagreement between them is then real evidence rather than a known artefact.
+        countDeadLetter(reason.name());
+
         release(originalJson, job.eventId());
         return true;
     }
@@ -157,6 +203,16 @@ public class DeadLetterQueue {
         log.warn("DEAD-LETTERED an unparseable message ({} chars): {}",
                 rawMessage.length(), failureReason);
 
+        // Same placement rule as the other road: after the durability check, before the release.
+        //
+        // ⚠️ The reason is the ENUM CONSTANT and not `failureReason`, which is the exception type the
+        // parser produced. That parameter is bounded in practice and bounded by nothing in principle
+        // -- a new codec or a new Jackson version can invent a type nobody has seen -- and an
+        // unbounded label is precisely the defect fixed at 32a. The exception type is genuinely
+        // useful and belongs in the log line above and in the DLQ entry itself, both of which cost
+        // one row rather than one time series.
+        countDeadLetter(DlqReason.UNPARSEABLE.name());
+
         release(rawMessage, "<unparseable>");
         return true;
     }
@@ -171,6 +227,18 @@ public class DeadLetterQueue {
      *
      * @return the count, or {@code -1} if Redis could not be reached
      */
+    /**
+     * Increments the dead-letter counter for one reason.
+     *
+     * <p>Resolved through the registry on each call rather than cached per reason. Micrometer returns
+     * the same {@link Counter} instance for an identical name-and-tag set, so this is a lookup rather
+     * than a registration, and with three possible reasons the map is trivially small. Caching three
+     * fields by hand would add state to a class whose job is durability.
+     */
+    private void countDeadLetter(String reason) {
+        deadLetteredCounter.tag("reason", reason).register(registry).increment();
+    }
+
     public long size() {
         try {
             Long count = redis.opsForList().size(RedisKeys.DLQ);
