@@ -1,0 +1,96 @@
+# =============================================================================
+#  webhook-config (EKS) — every NON-SECRET setting that differs on AWS
+#
+#  🔴 THIS IS THE ENTIRE POINT OF THE CONFIGMAP DECISION MADE IN SESSION 4.
+#  Moving from a laptop to AWS changed FOUR VALUES IN THIS FILE and two image tags.
+#  Not one line of application logic changed, because every endpoint the app talks
+#  to was already an environment value pointing at something.
+#
+#  WHAT DIFFERS FROM k8s/local/01-configmap.yaml, exhaustively:
+#    REDIS_HOST     'redis' (a Service name)      -> the ElastiCache endpoint
+#    POSTGRES_URL   'postgres' (a Service name)   -> the RDS endpoint + sslmode
+#    REDIS_SSL      absent -> "true"              (ElastiCache is TLS-only)
+#    POSTGRES_DB    present -> REMOVED            (see below)
+#
+#  ⚠️ THESE ENDPOINTS ARE NOT STABLE ACROSS A TEARDOWN. Every `eksctl create cluster`
+#  builds a NEW VPC, and ElastiCache and RDS live inside it, so both hostnames change
+#  on every rebuild. This file therefore records a CURRENT FACT, not a permanent one.
+#  That is a real weakness of creating those two imperatively rather than in IaC --
+#  recorded in notes/interview/liabilities.md rather than hidden.
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: webhook-config
+  namespace: webhooks
+  labels:
+    app.kubernetes.io/part-of: webhook-delivery-service
+data:
+  # ---------------------------------------------------------------------------
+  # THE ELASTICACHE PRIMARY ENDPOINT.
+  #
+  # Locally this was 'redis' -- a Kubernetes Service name resolved by the cluster's
+  # own DNS to whichever Redis pod was healthy. Here there is no Redis pod and no
+  # Service; this is a public DNS name that resolves to a PRIVATE address
+  # (10.0.x.x) reachable only from inside the VPC. The name resolves for anyone;
+  # the address is useless to them. That distinction is what 27c proves.
+  #
+  # ⚠️ 'master.' is not decoration -- it is the primary endpoint of a REPLICATION
+  # GROUP. Redis had to be created as a replication group rather than a standalone
+  # cache cluster because ElastiCache refuses transit encryption on the latter
+  # (27a). One node, no replica; the shape was forced by the security requirement.
+  # ---------------------------------------------------------------------------
+  REDIS_HOST: "master.webhook-redis.zkedgk.use1.cache.amazonaws.com"
+
+  REDIS_PORT: "6379"
+
+  # ---------------------------------------------------------------------------
+  # 🔴 THE SETTING THAT WOULD OTHERWISE COST AN HOUR OF DEBUGGING.
+  #
+  # ElastiCache was created with --transit-encryption-enabled, which cannot be
+  # turned off later. That endpoint speaks TLS and nothing else. Lettuce speaks
+  # plaintext unless told otherwise, and there is no negotiation step in the Redis
+  # protocol for it to discover the difference.
+  #
+  # ⚠️ MEASURED AT 27a: a plaintext client against this endpoint does NOT get an
+  # error. It HANGS -- the client sends bytes that are not a TLS handshake, the
+  # server waits for a handshake, the client waits for a reply, and neither side has
+  # yet seen anything wrong. It surfaces as a CONNECTION TIMEOUT, which sends you to
+  # the security group, the subnets and the NAT gateway before it sends you here.
+  #
+  # Defaults to false in application.properties so ONE image still runs against the
+  # plaintext docker-compose Redis. Set true only here.
+  # ---------------------------------------------------------------------------
+  REDIS_SSL: "true"
+
+  # ---------------------------------------------------------------------------
+  # THE RDS ENDPOINT. Read by the WORKER only.
+  #
+  # ⚠️ sslmode=require IS A DELIBERATE, LIMITED CLAIM. It encrypts the connection.
+  # It does NOT verify that the server on the other end is really our database --
+  # that is sslmode=verify-full, which additionally needs the RDS CA bundle baked
+  # into the image and a hostname match. So this defends against someone reading
+  # traffic, not against someone impersonating the database, and the second attack
+  # requires being inside a VPC whose only entry point is the node security group.
+  # Stated rather than glossed as "we use SSL"; verify-full is the production answer
+  # and it is on liabilities.md.
+  #
+  # It is explicit rather than left to the driver's default because the pgjdbc
+  # default (`prefer`) SILENTLY FALLS BACK TO PLAINTEXT if the server allows it.
+  # A setting whose failure mode is "quietly less secure" should never be implicit.
+  # ---------------------------------------------------------------------------
+  POSTGRES_URL: "jdbc:postgresql://webhook-db.ccxs6u8i8102.us-east-1.rds.amazonaws.com:5432/webhookdb?sslmode=require"
+
+  # ---------------------------------------------------------------------------
+  # 🔴 POSTGRES_DB IS DELIBERATELY ABSENT, AND ITS ABSENCE IS THE CORRECT STATE.
+  #
+  # Locally that key was read by the POSTGRES POD ITSELF -- its entrypoint creates
+  # the database on first boot. On EKS there is no Postgres pod: RDS created
+  # `webhookdb` from the --db-name argument at instance creation. Verified before
+  # removing it, rather than assumed: the only references in k8s/local/ are inside
+  # 04-postgres.yaml, which does not exist here.
+  #
+  # Carrying it anyway would cost nothing and mislead everything -- this file's own
+  # rule is that a key no container reads is dead config that still reads as
+  # configured, and the next person assumes it is doing something.
+  # ---------------------------------------------------------------------------

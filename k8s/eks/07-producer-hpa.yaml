@@ -1,0 +1,143 @@
+# =============================================================================
+#  HorizontalPodAutoscaler for the producer.
+#
+#  The producer only. The worker is scaled by hand with `kubectl scale` (22b),
+#  and that asymmetry is a design decision rather than an omission:
+#
+#    producer  CPU-BOUND. Every request costs parsing, Bean Validation, a DNS
+#              resolution for the SSRF gate, serialisation and a Redis push.
+#              More requests => proportionally more CPU. Utilisation IS the
+#              arrival rate, so CPU is an honest signal.
+#
+#    worker    I/O-BOUND. It spends its life blocked on a socket waiting for a
+#              subscriber we do not control. 🔴 A worker holding a 10,000-job
+#              backlog and a worker with an empty queue report THE SAME CPU,
+#              because in both cases the thread is parked. A CPU-based HPA there
+#              would not fire late -- it could not tell drowning from idle, and
+#              would scale DOWN a system that is underwater.
+#
+#  The honest metric for a queue consumer is queue depth (LLEN webhooks:queue),
+#  which the HPA has no way to read. Getting it there needs KEDA or a custom
+#  metrics adapter, both out of scope. The gap is NAMED rather than papered over
+#  with a knob that looks like autoscaling and can never fire.
+#
+#  REQUIRES metrics-server (enabled at 20a). Without it this object installs
+#  with no error at all and simply never fires -- which looks exactly like
+#  "it decided not to scale." An absent component fails silently.
+# =============================================================================
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: producer
+  namespace: webhooks
+  labels:
+    app: producer
+    app.kubernetes.io/part-of: webhook-delivery-service
+spec:
+  # ---------------------------------------------------------------------------
+  # WHAT IT DRIVES. scaleTargetRef names the controller whose replica count this
+  # HPA now owns -- it does not touch pods directly. The chain is unchanged:
+  # HPA writes Deployment.spec.replicas -> the Deployment updates its ReplicaSet
+  # -> the ReplicaSet creates or deletes pods.
+  #
+  # 🔴 "OWNS" IS LITERAL, AND IT IS THE TRAP IN THIS FILE. Once this exists,
+  # `replicas` in 05-producer.yaml is no longer the source of truth. Leaving the
+  # field there means every `kubectl apply -f k8s/local/` resets the count to
+  # the hardcoded number and the HPA scales it back moments later -- an
+  # invisible tug-of-war between two things that both believe they are in
+  # charge. The fix is to DELETE the field from the Deployment, which is why
+  # 05-producer.yaml no longer carries one.
+  # ---------------------------------------------------------------------------
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: producer
+
+  # ---------------------------------------------------------------------------
+  # THE BOUNDS.
+  #
+  # minReplicas: 2 -- the availability floor, not a capacity number. One replica
+  #   means a rolling update, an eviction or a node problem takes the front door
+  #   to zero. It also matches what 21d chose two replicas FOR: a Service with
+  #   one endpoint never has to load-balance, so the thing a Service exists to
+  #   do goes untested.
+  #
+  # maxReplicas: 4 -- 🔴 A CAPACITY DECISION, MEASURED, NOT A WISH.
+  #   Each replica reserves 512Mi. Memory requests across the node currently
+  #   total 3122Mi, and the REAL ceiling is Docker's cap on the minikube
+  #   container -- 4718592000 bytes = 4500Mi:
+  #        3 producers -> 3634Mi   (81% of the real cap)
+  #        4 producers -> 4146Mi   (92%)
+  #        5 producers -> 4658Mi   (OVER the cap)
+  #   ⚠️ And the scheduler would happily ACCEPT the fifth, because 20a measured
+  #   this node advertising the HOST's 8 CPU / 5924Mi rather than its own cap
+  #   (docker driver -> the kubelet reads the host's /proc). So the failure at
+  #   maxReplicas: 5 is not `Pending`, which would be honest -- it is Docker
+  #   OOMKilling pods whose own limits look perfectly fine.
+  #
+  #   The general point survives the laptop: maxReplicas is a blast radius. It
+  #   is what stops a traffic spike, a retry storm or a metrics bug from turning
+  #   into an unbounded bill or an exhausted cluster.
+  # ---------------------------------------------------------------------------
+  minReplicas: 2
+  maxReplicas: 4
+
+  # ---------------------------------------------------------------------------
+  # THE SIGNAL.
+  #
+  # averageUtilization is a PERCENTAGE OF THE CPU REQUEST -- not of a core, not
+  # of the limit, not of the machine. The producer requests 100m, so:
+  #
+  #        target 50%  ==  "scale when the average pod sustains 50m"
+  #
+  # 🔴 Which makes the request in 05-producer.yaml load-bearing in a second,
+  # non-obvious way. Take a pod doing exactly 50m of real work:
+  #        request 100m  -> reads 50%  -> scales          ✅
+  #        request 1000m -> reads  5%  -> never scales    ❌
+  # Identical work, opposite decision, and nothing about the application
+  # changed. Promise too much and the autoscaler is decoration; promise too
+  # little and it panics on ordinary traffic. Measured idle here is 16-26m
+  # (~20% of the request), which leaves the signal room to actually move.
+  #
+  # WHY 50% AND NOT 90%: the target must leave enough headroom to absorb load
+  # during the reaction lag. Scaling is not instant -- metrics-server scrapes on
+  # an interval, the HPA evaluates on another (~15s each), and a new JVM pod
+  # needs 5-15s to boot and pass its startupProbe. That is roughly 30-60s during
+  # which the EXISTING pods carry all of the new traffic. At a 90% target there
+  # is nothing left to carry it with, and the first thing users see is latency.
+  #
+  # ⚠️ 50% is also why the cpu LIMIT is deliberately generous (1000m). A limit
+  # near the request would throttle the container at exactly the point the HPA
+  # needs to observe growth -- measured usage flattens, the HPA reads "load
+  # stopped rising", and every request quietly gets slower.
+  # ---------------------------------------------------------------------------
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 50
+
+  # ---------------------------------------------------------------------------
+  # `behavior` is deliberately NOT set, so the defaults apply, and they are
+  # ASYMMETRIC on purpose:
+  #
+  #   scale UP    stabilization 0s   -- react immediately
+  #   scale DOWN  stabilization 300s -- 🔴 FIVE MINUTES of sustained low usage
+  #                                     before a single pod is removed
+  #
+  # The asymmetry is the whole design: adding a pod you did not need costs a
+  # little money, removing one you did need during a lull costs an outage. The
+  # window is what stops flapping -- scale down, traffic returns, scale up,
+  # repeat -- and a flapping autoscaler is worse than none, because every cycle
+  # pays a cold JVM start.
+  #
+  # ⚠️ The practical consequence when testing: after load stops, the replica
+  # count sits unchanged for five minutes. That is correct behaviour and it
+  # looks exactly like a broken HPA.
+  #
+  # Left at the default rather than tuned, because a value written into a
+  # manifest is a value two environments are permitted to disagree about (21a),
+  # and nothing here needs to differ from what Kubernetes already chose.
+  # ---------------------------------------------------------------------------

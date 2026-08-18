@@ -1,0 +1,395 @@
+# =============================================================================
+#  Producer — the HTTP front door. Deployment + ClusterIP Service.
+#
+#  This is the first manifest where a PROBE ACTS. Everything before it was
+#  reporting: 19d made the app tell the truth about its dependencies, and 20c
+#  proved nobody was asking -- an unprobed pod reports 1/1 Ready while its own
+#  readiness endpoint returns 503. The probes below are what make that honesty
+#  count for anything.
+#
+#  In production the shape is identical; what changes is how traffic ARRIVES.
+#  Here the Service is ClusterIP and reached with `kubectl port-forward` (21f).
+#  In Session 5 an Ingress + AWS ALB terminates HTTPS in front of this same
+#  Service. The Deployment does not change.
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: producer
+  namespace: webhooks
+  labels:
+    app: producer
+    app.kubernetes.io/part-of: webhook-delivery-service
+spec:
+  # ---------------------------------------------------------------------------
+  # TWO replicas, not one, for a reason that is about verification as much as
+  # capacity: until now NEITHER Service has ever had more than one endpoint
+  # behind it, so load-balancing -- the thing a Service exists to do -- is
+  # completely untested. Two makes the Service do its actual job.
+  #
+  # ⚠️ replicas is a WISH, not a guarantee. If the node has no unreserved
+  # request capacity left the second pod sits Pending forever and the Deployment
+  # reports 1/2. Nothing forces it on.
+  #
+  # 🔴 SO WHERE IS `replicas`? DELETED ON PURPOSE AT 22a, AND THE FIELD BEING
+  # ABSENT IS THE POINT. 07-producer-hpa.yaml now OWNS this number, and
+  # "owns" turned out to be literal -- measured:
+  #
+  #     replicas BEFORE apply: 4          <- the HPA had scaled up under load
+  #     kubectl apply -f 05-producer.yaml -> deployment.apps/producer configured
+  #     replicas AFTER apply:  2          <- the manifest silently won
+  #
+  # A hardcoded `replicas` here does not coexist with an autoscaler, it FIGHTS
+  # it: every `kubectl apply -f k8s/local/` resets the count to the literal in
+  # this file and the HPA scales it back up ~15s later. Nothing errors. The tell
+  # is `configured` where you expected `unchanged` -- which is also why 21d
+  # chased the cpu "1" vs "1000m" normalisation, because once every apply prints
+  # `configured` you can no longer see a real change.
+  #
+  # ⚠️ The consequence to know for a cold `minikube start` (24a): with no
+  # `replicas` field and no HPA yet, the Deployment takes the API default of ONE
+  # replica. The HPA's minReplicas: 2 restores the second one within seconds of
+  # being applied. Briefly 1, then 2 -- correct, and it looks wrong.
+  #
+  # The floor and ceiling now live in the HPA, which is the honest place for
+  # them: minReplicas: 2 (availability) and maxReplicas: 4 (node capacity).
+  # ---------------------------------------------------------------------------
+
+  # RollingUpdate (the default) is CORRECT here and was wrong for the datastores
+  # at 21c. Two producers briefly overlapping is harmless -- they are stateless
+  # and hold nothing -- and it is what keeps the front door open during a deploy.
+  # "Briefly two of them" is only dangerous when they hold data.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # ⚠️ CHANGED AT 23b, and the reason is the node rather than the app.
+      # This was maxUnavailable: 0 / maxSurge: 1 -- never drop below `replicas`,
+      # add one extra while rolling. That is the right shape for a stateless front
+      # door and it is the wrong shape for THIS node: memory requests sit at 4162Mi
+      # against Docker's real 4500Mi cap, and a surge pod adds another 512Mi request
+      # the scheduler would accept (it validates against the ADVERTISED 5924Mi -- 20a)
+      # and the machine cannot hold. That is precisely the condition 22a's restart
+      # storm grew out of.
+      #
+      # Replace-in-place instead. COST, STATED: one of two producers is briefly gone,
+      # so capacity halves for a few seconds during a deploy. On a real cluster with
+      # real headroom this goes back to maxSurge: 1.
+      maxUnavailable: 1
+      maxSurge: 0
+
+  selector:
+    matchLabels:
+      app: producer
+  template:
+    metadata:
+      labels:
+        app: producer
+    spec:
+      # See 03-redis.yaml for the full story. Short version: Kubernetes injects
+      # REDIS_PORT=tcp://10.x.x.x:6379 into every pod because a Service named
+      # `redis` exists, and that is the exact name of one of our ConfigMap keys.
+      # Here it is LOAD-BEARING rather than precautionary -- this is the app that
+      # reads REDIS_PORT and dies binding "tcp://..." to an int.
+      enableServiceLinks: false
+
+      # -----------------------------------------------------------------------
+      # POD-LEVEL securityContext. 🔴 THIS is what ENFORCES non-root.
+      #
+      # The Dockerfile's `USER 65532` only ASKS -- a manifest can override it,
+      # and an image that merely prefers non-root is not a guarantee. Setting
+      # runAsNonRoot: true makes the kubelet REFUSE to start a container that
+      # would run as uid 0, before any application code executes.
+      #
+      # ⚠️ And note the mirror image at 21c: this exact flag BREAKS the official
+      # Postgres image, which starts as root on purpose to initialise its data
+      # directory and drops privileges itself. Same flag, opposite verdict,
+      # decided entirely by who built the image. Security hardening is not a
+      # checklist you apply uniformly.
+      #
+      # runAsUser/runAsGroup are stated explicitly rather than inherited: it
+      # makes the manifest self-describing, and runAsNonRoot alone would accept
+      # ANY non-zero uid the image happened to declare.
+      # -----------------------------------------------------------------------
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        # Restricts the container to the container runtime's default set of
+        # allowed system calls. Blocks whole classes of kernel exploit for free.
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+      - name: producer
+        image: 245976211964.dkr.ecr.us-east-1.amazonaws.com/webhook-producer:0.3.0
+        # 🔴 A FULLY-QUALIFIED REGISTRY HOST, WHICH IS WHY THIS ONE WORKS AND THE
+        # LOCAL ONE COULD NOT. `webhook-producer:0.2.0` has no host, so Kubernetes
+        # assumes Docker Hub -- fine on minikube, where the image was side-loaded
+        # onto the node and never pulled. On EKS there is no side-loading: the
+        # kubelet on each node pulls, so the image must exist somewhere the NODE
+        # can reach. ECR is OUTSIDE the VPC, so that pull goes out through the NAT.
+        #
+        # 🔴 AND NOTHING HERE HOLDS A CREDENTIAL. There is no imagePullSecret. The
+        # node's IAM role carries AmazonEC2ContainerRegistryReadOnly, so the kubelet
+        # authenticates to ECR as the machine it runs on. That is also why the
+        # permission is account-wide rather than per-repository.
+        #
+        # 0.3.0, not a rebuild of 0.2.0: the tags are IMMUTABLE in ECR, and 23b
+        # already measured that a node holding a tag will not reliably replace it.
+        imagePullPolicy: IfNotPresent
+
+        ports:
+        - name: http           # named so the probes and the Service can refer to
+          containerPort: 8080  # it by name instead of repeating the number
+
+        # -------------------------------------------------------------------
+        # CONFIG: every key named explicitly with configMapKeyRef /
+        # secretKeyRef, never envFrom. Measured at 21a: a key named explicitly
+        # and missing REFUSES to start the container with
+        # `couldn't find key ... in ConfigMap`, while the same typo under
+        # envFrom is silently skipped and the app falls back to its default --
+        # and REDIS_HOST's default is `localhost`, which inside a pod is THE POD
+        # ITSELF. Six lines per variable buys a loud failure instead of a silent
+        # one, and writing the key name twice is not duplication, it is the only
+        # thing comparing the two spellings.
+        #
+        # The producer reads THREE variables. POSTGRES_URL is deliberately
+        # absent: the producer never touches Postgres, and the Deployment -- not
+        # the shared ConfigMap -- is the honest record of what a service needs.
+        # -------------------------------------------------------------------
+        env:
+        - name: REDIS_HOST
+          valueFrom:
+            configMapKeyRef: { name: webhook-config, key: REDIS_HOST }
+        - name: REDIS_PORT
+          valueFrom:
+            configMapKeyRef: { name: webhook-config, key: REDIS_PORT }
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef: { name: webhook-secrets, key: REDIS_PASSWORD }
+        # ADDED FOR EKS. ElastiCache is TLS-only and Lettuce does not negotiate --
+        # without this the pod hangs on connect rather than reporting an error (27a).
+        - name: REDIS_SSL
+          valueFrom:
+            configMapKeyRef: { name: webhook-config, key: REDIS_SSL }
+
+        # -------------------------------------------------------------------
+        # STARTUP PROBE -- closes a gap carried since 19d ("no startupProbe on
+        # either service").
+        #
+        # It answers "have you finished booting?" and holds the other two probes
+        # off until it passes. Without it you must guess an initialDelaySeconds
+        # for liveness, and a guess is wrong in both directions: too short kills
+        # a healthy app that is still starting (and it never finishes, forever),
+        # too long delays detection of a genuinely wedged process for the whole
+        # delay on every restart.
+        #
+        # A startupProbe replaces that guess with a BUDGET: check every 2s, allow
+        # up to N failures, then hand over.
+        #
+        # 🔴 THIS BUDGET WAS 30s AND IT WAS MEASURED TOO SMALL AT 22a. The number
+        # was calibrated against a ~1.7s boot on an IDLE node -- roughly 17x
+        # headroom, which looked generous. Then the node went NotReady for ~12s,
+        # every pod in the namespace cold-started at the same moment, and five
+        # JVMs contended for four cores. Measured from the container's own log:
+        #
+        #     idle node       Started ProducerApplication in 1.7s
+        #     contended       Root WebApplicationContext init alone = 19,470 ms,
+        #                     Tomcat still had not bound port 8080 at 30s
+        #
+        # So the probe killed an application that was starting CORRECTLY. And
+        # the kill is not neutral -- the replacement is another cold JVM start,
+        # which adds contention, which pushes the next pod over the same budget.
+        # Producers reached 5 restarts and workers 4 before it was broken by
+        # hand. 🔴 A startup budget that is too small does not fail once; it
+        # becomes a self-sustaining spiral, because its own remedy is the thing
+        # causing the load.
+        #
+        # 90s, and the asymmetry is the argument: a startupProbe runs ONCE per
+        # container start, so a generous budget costs only a slower verdict on
+        # an app that is genuinely broken. A tight budget costs an outage that
+        # sustains itself. Calibrate a startup budget against the CONTENDED
+        # boot -- the idle boot is the case that never needed the probe.
+        # -------------------------------------------------------------------
+        startupProbe:
+          httpGet:
+            path: /actuator/health/liveness
+            port: http
+          periodSeconds: 2
+          failureThreshold: 45      # 45 x 2s = 90s to finish starting
+          timeoutSeconds: 3
+
+        # -------------------------------------------------------------------
+        # READINESS -- "can this pod be sent traffic right now?"
+        # Failure => the pod is REMOVED from the Service's endpoint list and
+        # requests stop arriving. It is NOT restarted.
+        #
+        # This is the URL 19b found reporting 200 UP while every POST returned
+        # 500, and 19d fixed by putting the `redis` indicator into this group:
+        #     management.endpoint.health.group.readiness.include=readinessState,redis
+        #
+        # 🔴 timeoutSeconds: 5 -- AND THIS IS THE CARRIED GAP FROM 19d.
+        # Kubernetes defaults timeoutSeconds to ONE SECOND. This endpoint
+        # deliberately waits on Redis, so when Redis is unreachable it takes up
+        # to `spring.data.redis.timeout` (2s for the producer; 10s for the
+        # worker, which is why 21e needs a bigger number) to return its verdict.
+        # With the default, the probe would time out BEFORE the app answered --
+        # recording a probe timeout instead of reading the app's decision.
+        # The probe would be measuring itself.
+        # -------------------------------------------------------------------
+        readinessProbe:
+          httpGet:
+            path: /actuator/health/readiness
+            port: http
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3       # ~30s of sustained failure before removal
+          successThreshold: 1       # one good answer puts it straight back
+
+        # -------------------------------------------------------------------
+        # LIVENESS -- "is this process wedged? would a restart fix it?"
+        # Failure => the container is KILLED and restarted.
+        #
+        # 🔴 It reads /health/liveness, which contains ONLY livenessState -- no
+        # redis, no db. That omission is the most important design decision in
+        # this file. If liveness reported Redis, a 30-second Redis outage would
+        # make Kubernetes kill and restart every producer pod, which then cold-
+        # start into a Redis that is still down, with backoff stacking:
+        # a dependency outage converted into a self-inflicted one.
+        #
+        # A restart cannot produce a Redis, so a Redis outage must never trigger
+        # one. THE RULE: would a restart fix this? yes -> liveness. no -> readiness.
+        #
+        # No initialDelaySeconds is needed -- the startupProbe above holds this
+        # off until the app has booted once. Longer period than readiness because
+        # a wedged process is rarer and each check costs a request.
+        # -------------------------------------------------------------------
+        livenessProbe:
+          httpGet:
+            path: /actuator/health/liveness
+            port: http
+          periodSeconds: 20
+          timeoutSeconds: 3
+          failureThreshold: 3
+
+        # -------------------------------------------------------------------
+        # RESOURCES. Full mental model in
+        # notes/session-4/foundations/07-the-words-of-docker-and-kubernetes.md
+        # ("Requests, limits and autoscaling"). The numbers, and why:
+        #
+        # cpu request 100m -- the request is the ONLY number the scheduler reads,
+        #   AND it is the denominator the HPA divides real usage by at 22a. So the
+        #   number written here decides when scaling happens as much as the traffic
+        #   does: at a 50% target, 100m means "scale when a pod sustains 50m."
+        #   Promise 1000m instead and the same real work reads as 5% -- an
+        #   autoscaler that looks configured and can never fire.
+        #   Measured idle usage for this app is ~13-25m, so 100m is an honest
+        #   reservation with room for the signal to move.
+        #
+        # cpu limit 1000m -- generous ON PURPOSE, set by JVM STARTUP rather than
+        #   steady state: JIT compilation and class loading briefly want a whole
+        #   core. A tight CPU limit does not kill, it THROTTLES -- so a 1.7s boot
+        #   stretches out and can start tripping the very probes above. And a
+        #   limit close to the request hides the truth from the HPA, because
+        #   throttled usage plateaus and reads as "load stopped growing."
+        #
+        # memory request == limit (512Mi) -- deliberate, so the pod can never
+        #   exceed the memory it reserved. Under node memory pressure the kubelet
+        #   evicts by how far a pod is OVER its memory request; a pod that cannot
+        #   exceed its request has nothing to be over by.
+        #
+        #   🔴 MEASURED CORRECTION, and it is a real trade rather than a typo:
+        #   this pod's QoS class is `Burstable`, NOT `Guaranteed`. Guaranteed
+        #   requires request == limit for *every* resource -- including CPU -- and
+        #   ours are deliberately 100m vs 1000m. So the two goals are in DIRECT
+        #   CONFLICT and you cannot have both:
+        #        Guaranteed QoS          wants cpu request == cpu limit
+        #        an HPA that can fire    wants a LOW cpu request and headroom above it
+        #   We chose the HPA, because 22a's autoscaler is a deliverable and
+        #   eviction pressure on a single-node laptop cluster is not. The exposure
+        #   we accept is the QoS *label*; the memory behaviour we wanted is intact,
+        #   since request == limit means this container is OOMKilled at exactly the
+        #   number it reserved and can never drift above it.
+        #
+        #   ⚠️ 20a measured this node advertising the HOST's 6 GB rather than its
+        #   own 4.5 GB cap, so the scheduler will accept what Docker then
+        #   OOMKills -- which is what makes these requests load-bearing.
+        #
+        # ⚠️ The limit does NOT set the heap. Java reads the cgroup limit and
+        # takes a percentage; 19b sets -XX:MaxRAMPercentage=75 in the Dockerfile,
+        # so 512Mi gives ~384Mi of heap and ~128Mi for metaspace, thread stacks
+        # and native memory -- all of which count toward the OOMKill limit.
+        # -------------------------------------------------------------------
+        # ⚠️ Written as "1", not "1000m", and they mean the identical thing (one
+        # whole core). The reason is idempotency, and it was measured: the API
+        # server NORMALISES 1000m -> 1, so `last-applied-configuration` keeps
+        # "1000m" while the live object holds "1". Every `kubectl apply` then
+        # computes a patch to set it back, the server re-normalises, and apply
+        # prints `deployment.apps/producer configured` FOREVER -- with
+        # generation, observedGeneration and the pods all unchanged.
+        # Harmless in itself, and it destroys the usefulness of the word
+        # `configured`: if every apply says it, you can never spot a real change.
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "512Mi"
+          limits:
+            cpu: "1"            # == 1000m, one whole core
+            memory: "512Mi"
+
+        # -------------------------------------------------------------------
+        # CONTAINER-LEVEL hardening, on top of the pod-level block above.
+        #
+        # readOnlyRootFilesystem: an attacker who reaches this container cannot
+        #   write a tool, a script or a payload anywhere -- there is nowhere
+        #   writable. It also catches an application that quietly depends on
+        #   writing to disk, which is worth knowing about.
+        #   ⚠️ Tomcat NEEDS a writable temp directory, so /tmp is supplied as an
+        #   emptyDir below. Without it the container fails to start -- read-only
+        #   root filesystem is the one hardening flag that regularly needs a
+        #   paired volume.
+        #
+        # capabilities: drop ALL -- Linux splits root's powers into ~40 discrete
+        #   capabilities (bind a low port, change file ownership, load a kernel
+        #   module). A JVM serving HTTP on 8080 needs none of them.
+        # -------------------------------------------------------------------
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+
+      volumes:
+      # An emptyDir is scratch space created empty when the pod starts and
+      # destroyed with it. Exactly right for a temp directory: Tomcat gets
+      # somewhere to write, and nothing survives -- which is the point.
+      - name: tmp
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: producer
+  namespace: webhooks
+  labels:
+    app: producer
+    app.kubernetes.io/part-of: webhook-delivery-service
+spec:
+  # ClusterIP: reachable only from inside the cluster. 21f reaches it with
+  # `kubectl port-forward`, which tunnels a local port in for as long as the
+  # command runs and opens nothing permanently. NodePort would work and was not
+  # used -- it opens a port on the node for anyone who can reach it, and the
+  # production path is an Ingress + ALB (Session 5), so a NodePort would be a
+  # third mechanism that never ships.
+  type: ClusterIP
+  selector:
+    app: producer          # ⚠️ a LABEL QUERY. A typo matches nothing, gives zero
+  ports:                   #    endpoints, and refuses every connection while the
+  - name: http             #    Deployment still reports 2/2.
+    port: 8080
+    targetPort: http       # by NAME, so changing the container port needs one edit
+    protocol: TCP

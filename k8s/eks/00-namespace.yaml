@@ -1,0 +1,40 @@
+# =============================================================================
+#  webhooks namespace
+#
+#  ADDED AT 28b TO CLOSE HALF OF A LIABILITY THIS PROJECT HAD ALREADY RECORDED.
+#
+#  Task 24a proved by execution that a fresh clone could NOT bring this system up:
+#  every manifest in k8s/ declares `namespace: webhooks`, and NOTHING created it.
+#  It had been made by hand, days earlier, and the calendar was the only thing
+#  enforcing the dependency. `kubectl apply -f k8s/eks/` on a clean cluster failed
+#  on every object at once with the same unhelpful shape of error.
+#
+#  🔴 THE FILENAME IS THE MECHANISM, NOT DECORATION. `kubectl apply -f <dir>` applies
+#  files in LEXICAL ORDER, so `00-` guarantees the namespace exists before anything
+#  that declares membership in it. That is the same reason every other file here is
+#  numbered. It is also why the fix is a file rather than a remembered command --
+#  a command in a README is a dependency that only exists if someone reads it.
+#
+#  ⚠️ THIS ONLY CLOSES HALF THE GAP, AND THE OTHER HALF STAYS OPEN ON PURPOSE.
+#  The `webhook-secrets` Secret is still created imperatively from .env, because a
+#  Secret in committed YAML is a password in git and git history is append-only.
+#  So bringing this up from a clone is still TWO commands, not one:
+#
+#      kubectl create secret generic webhook-secrets -n webhooks --from-env-file=<trimmed .env>
+#      kubectl apply -f k8s/eks/
+#
+#  See k8s/local/02-secret.yaml.example for the shape and the exact command.
+#
+#  ⚠️ A NAMESPACE IS GROUPING, NOT ISOLATION. It scopes names and gives RBAC and
+#  quotas something to attach to. It does NOT stop traffic -- a pod here can reach a
+#  pod anywhere else in the cluster, and the Prometheus operator in the `monitoring`
+#  namespace reads ServiceMonitors across this boundary, which is how the monitoring
+#  in 08/09 works at all. Blocking traffic needs a NetworkPolicy, which this cluster
+#  does not have.
+# =============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: webhooks
+  labels:
+    app.kubernetes.io/part-of: webhook-delivery-service
