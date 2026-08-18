@@ -1,0 +1,42 @@
+# =============================================================================
+#  aws-load-balancer-controller — Helm values (chart 3.5.0, app v3.5.0)
+#
+#  WHAT THIS POD IS. It is a CONTROLLER: it watches the Kubernetes API for
+#  Ingress objects, and for each one it calls the AWS API to build a real
+#  Application Load Balancer, target groups, listeners and rules. Nothing else
+#  in this project creates an ALB, and the ALB therefore exists in NO manifest
+#  in this repo — it is a side effect of k8s/eks/10-ingress.yaml. That is why
+#  deploy/teardown.sh must delete load balancers FIRST, while the cluster is
+#  still up and this controller is still alive to do the deletion.
+#
+#  INSTALL (the policy + IRSA role must exist first — see deploy/iam/):
+#    helm upgrade --install aws-load-balancer-controller \
+#      eks/aws-load-balancer-controller --version 3.5.0 -n kube-system \
+#      -f deploy/alb-controller-values.yaml
+# =============================================================================
+
+# Which cluster's Ingress objects to act on. The controller TAGS every AWS
+# resource it creates with this name, and refuses to touch resources tagged for
+# a different cluster — that is what keeps two clusters in one account from
+# deleting each other's load balancers.
+clusterName: webhook-eks
+
+# -----------------------------------------------------------------------------
+# 🔴 THE IRSA HALF OF THE INSTALL.
+#
+# create: false is the whole point. eksctl already created this ServiceAccount
+# together with an IAM role whose trust policy names this exact
+# namespace+name pair (system:serviceaccount:kube-system:aws-load-balancer-controller).
+# If Helm created its own ServiceAccount here it would be UNANNOTATED, the pod
+# would get no role, and every AWS call would fail with AccessDenied — the
+# failure looks like a broken IAM policy but is really a second, empty identity.
+# -----------------------------------------------------------------------------
+serviceAccount:
+  create: false
+  name: aws-load-balancer-controller
+
+# Given explicitly rather than discovered. Left unset, the controller reads them
+# from EC2 instance metadata at startup; naming them removes that dependency and
+# makes a misconfiguration fail loudly at install time instead of at first Ingress.
+region: us-east-1
+vpcId: vpc-0d28c9d6738ed5df3
