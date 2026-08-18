@@ -39,4 +39,18 @@ serviceAccount:
 # from EC2 instance metadata at startup; naming them removes that dependency and
 # makes a misconfiguration fail loudly at install time instead of at first Ingress.
 region: us-east-1
-vpcId: vpc-0d28c9d6738ed5df3
+# ⚠️ REBUILD-FRAGILE, AND IT WAS NOT ON THE REBUILD CHECKLIST (found at 33b).
+#
+# This id changes every time the cluster is recreated, because eksctl builds a new
+# VPC. On the 2026-08-18 rebuild this file still named the DELETED VPC while the two
+# datastore endpoints -- the values the checklist DID warn about -- regenerated
+# identically and needed no edit at all. The one that mattered was the one nobody
+# had written down.
+#
+# 🔴 Contrast with the Ingress's subnets, which are discovered from the
+# `kubernetes.io/role/elb` tag and survive a rebuild untouched. That is the pattern
+# this line does not follow. The controller CAN discover the VPC itself when this is
+# omitted; leaving it explicit is the Session 5 configuration that was proven to
+# work, and changing it mid-rebuild would swap a known-good setup for an untested
+# one to save a future edit. Recorded in what-id-add-next.md instead.
+vpcId: vpc-00dbe4089c5e48526

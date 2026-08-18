@@ -98,7 +98,7 @@ metadata:
     # us-west-2 is invisible to a us-east-1 load balancer. (CloudFront is the
     # exception that trips people: it requires us-east-1 regardless.)
     # -------------------------------------------------------------------------
-    alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:us-east-1:245976211964:certificate/016d9d8a-d417-4694-a0e4-da2d14e5cfea
+    alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:us-east-1:245976211964:certificate/2a879909-4894-41e0-b24b-53c135099c56
 
     # -------------------------------------------------------------------------
     # TLS 1.3 preferred, TLS 1.2 floor, and NOTHING below it. The ALB default
