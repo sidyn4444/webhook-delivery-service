@@ -1,0 +1,194 @@
+# =============================================================================
+#  webhook-ingress — the ONE object that puts this system on the public internet
+#
+#  🔴 WHAT THIS FILE ACTUALLY CREATES, AND WHY THAT MATTERS FOR TEARDOWN.
+#  An Ingress is a REQUEST, not a load balancer. The aws-load-balancer-controller
+#  pod (kube-system) watches for this object and calls the AWS API to build a real
+#  Application Load Balancer, a target group, two listeners and their rules. So the
+#  ALB is a SIDE EFFECT of this file and appears in no manifest anywhere -- and it
+#  is owned by a controller that dies with the cluster.
+#
+#  ⚠️ CONSEQUENCE: `eksctl delete cluster` deletes the controller BEFORE anything
+#  deletes the ALB, and the orphaned ALB then blocks the VPC from being deleted
+#  while continuing to bill. deploy/teardown.sh therefore deletes load balancers
+#  FIRST, while the cluster and this controller are still alive.
+#
+#  THE REQUEST PATH THIS BUILDS:
+#    laptop --HTTPS--> ALB (public subnets, ACM cert, TLS terminated here)
+#           --HTTP--> producer POD IP directly (private subnets, inside the VPC)
+# =============================================================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: webhook-ingress
+  namespace: webhooks
+  labels:
+    app.kubernetes.io/part-of: webhook-delivery-service
+  annotations:
+    # -------------------------------------------------------------------------
+    # internet-facing = the ALB gets PUBLIC subnets and a public DNS name.
+    # 'internal' would place it in the private subnets and it would be reachable
+    # only from inside the VPC -- correct for a service-to-service API, wrong here,
+    # because the whole point is that a subscriber system on the open internet can
+    # POST to us.
+    # -------------------------------------------------------------------------
+    alb.ingress.kubernetes.io/scheme: internet-facing
+
+    # -------------------------------------------------------------------------
+    # 🔴 SUBNETS ARE DELIBERATELY NOT LISTED HERE.
+    #
+    # The controller discovers them from the tag `kubernetes.io/role/elb=1`, which
+    # eksctl put on both public subnets at cluster creation. Pinning the subnet IDs
+    # explicitly was the alternative and it is what most guides show.
+    #
+    # It was rejected because EVERY subnet ID in this VPC dies with the cluster --
+    # a rebuild produces four new ones. A hardcoded ID would make this file wrong
+    # the first time the stack is rebuilt, and wrong in a way that fails at ALB
+    # creation time rather than at apply time. The tag is a CONVENTION that the
+    # rebuild reproduces automatically. This is the one place in k8s/eks/ that is
+    # rebuild-proof, and it is rebuild-proof on purpose.
+    #
+    # ⚠️ The cost of discovery: it fails silently-ish if the tags are missing or if
+    # two subnets in the same AZ carry the tag. Tags verified before relying on them.
+    # -------------------------------------------------------------------------
+
+    # -------------------------------------------------------------------------
+    # target-type: ip -- the ALB sends traffic straight to POD IPs.
+    #
+    # This is possible only because the AWS VPC CNI gives every pod a real VPC
+    # address (10.0.x.x), so the ALB can route to a pod as if it were any other
+    # host in the VPC. The alternative, 'instance', targets the NODE's NodePort and
+    # then kube-proxy does a second hop to whichever pod it picks -- an extra
+    # network hop, and the client IP is rewritten by that hop.
+    #
+    # 'ip' also means the target group tracks pods, so a rolling deploy
+    # deregisters the old pod instead of leaving the ALB pointed at a dead one.
+    # -------------------------------------------------------------------------
+    alb.ingress.kubernetes.io/target-type: ip
+
+    # -------------------------------------------------------------------------
+    # Two listeners. 80 exists ONLY to be redirected -- see ssl-redirect below.
+    # -------------------------------------------------------------------------
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
+
+    # -------------------------------------------------------------------------
+    # 🔴 A 301 FROM PORT 80 TO 443 IS NOT THE SAME AS "WE USE HTTPS".
+    #
+    # The redirect protects the SECOND and later requests. The first request to
+    # http:// still crossed the internet in plaintext before the redirect came
+    # back -- headers, path, and anything already sent. For an API whose clients
+    # are programs, the real fix is that clients are configured with the https URL
+    # in the first place; the redirect is a safety net for the ones that aren't.
+    # (HSTS is the header that fixes the first request too, and it is not set here
+    # -- recorded in notes/interview/liabilities.md rather than claimed.)
+    #
+    # This is implemented by the controller as a listener RULE on port 80, not by
+    # any application code. The producer never sees these requests.
+    # -------------------------------------------------------------------------
+    alb.ingress.kubernetes.io/ssl-redirect: '443'
+
+    # -------------------------------------------------------------------------
+    # The ACM certificate. Free, auto-renewing, and its PRIVATE KEY IS NEVER
+    # DOWNLOADABLE -- ACM hands the key to the ALB internally and there is no API
+    # that returns it. That is the actual security argument for ACM over
+    # Let's Encrypt + cert-manager here: the key never exists on a machine we
+    # administer, so it cannot leak from one.
+    #
+    # ⚠️ The certificate MUST live in the same region as the ALB. A cert in
+    # us-west-2 is invisible to a us-east-1 load balancer. (CloudFront is the
+    # exception that trips people: it requires us-east-1 regardless.)
+    # -------------------------------------------------------------------------
+    alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:us-east-1:245976211964:certificate/016d9d8a-d417-4694-a0e4-da2d14e5cfea
+
+    # -------------------------------------------------------------------------
+    # TLS 1.3 preferred, TLS 1.2 floor, and NOTHING below it. The ALB default
+    # policy still allows TLS 1.0/1.1, which are deprecated (RFC 8996) and are what
+    # a scanner flags first. Stated explicitly because the default is the weaker one.
+    # -------------------------------------------------------------------------
+    alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-2021-06
+
+    # -------------------------------------------------------------------------
+    # 🔴 THE ALB'S HEALTH CHECK IS A SECOND, INDEPENDENT OPINION FROM THE KUBELET'S.
+    #
+    # The kubelet's readinessProbe decides whether the pod is an Endpoint of the
+    # Service. This decides whether the ALB's target group considers the pod
+    # healthy. They can disagree, and when they do the symptom is a 503 from the
+    # ALB while `kubectl get pods` shows 2/2 Ready -- which sends you to look at
+    # the application, where nothing is wrong.
+    #
+    # Pointed at the SAME path the readinessProbe uses so the two opinions are
+    # formed from the same evidence.
+    # -------------------------------------------------------------------------
+    alb.ingress.kubernetes.io/healthcheck-path: /actuator/health/readiness
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: '15'
+    alb.ingress.kubernetes.io/healthy-threshold-count: '2'
+    alb.ingress.kubernetes.io/unhealthy-threshold-count: '3'
+
+    # -------------------------------------------------------------------------
+    # A fixed name, so the ALB is identifiable in the console and -- more
+    # importantly -- greppable in deploy/teardown.sh's inventory. An ALB with a
+    # generated name is one you have to recognise by tag, and a resource you can
+    # only recognise by tag is one you will eventually leave running.
+    # ⚠️ 32-char limit; 'webhook-alb' is well inside it.
+    # -------------------------------------------------------------------------
+    alb.ingress.kubernetes.io/load-balancer-name: webhook-alb
+
+    # -------------------------------------------------------------------------
+    # 🔴 MEASURED, NOT ASSUMED: the first version of this file served /actuator
+    # to the public internet.
+    #
+    # The rule below is `path: /` Prefix, which means EVERY path the producer
+    # answers became internet-reachable the moment the ALB came up -- including
+    # /actuator/prometheus, which publishes queue depth, JVM internals and
+    # request timings to anyone. Probed after 30d and confirmed: 200 on
+    # /actuator, /actuator/health and /actuator/prometheus. (/actuator/env and
+    # /actuator/configprops returned 404 -- the Session 4 exposure allowlist was
+    # already limiting the blast radius, which is why this is an information leak
+    # and not a credential leak.)
+    #
+    # THE FIX COSTS NOTHING because Prometheus does NOT scrape through the ALB.
+    # 08-servicemonitor-producer.yaml scrapes the pod directly, in-cluster, via
+    # the Service. Closing the path at the load balancer removes public access
+    # without touching the monitoring path at all.
+    #
+    # ⚠️ Done as a FIXED-RESPONSE ACTION at the ALB rather than in Spring
+    # Security, deliberately: the request is rejected at the edge and never
+    # reaches a pod, so it costs no application CPU and cannot be affected by an
+    # application bug. The trade is that the rule now lives in two systems --
+    # the actuator allowlist in application.properties and this one -- and they
+    # have to be reasoned about together.
+    # -------------------------------------------------------------------------
+    alb.ingress.kubernetes.io/actions.deny-actuator: >
+      {"type":"fixed-response","fixedResponseConfig":{"contentType":"application/json","statusCode":"403","messageBody":"{\"error\":\"forbidden\",\"detail\":\"management endpoints are not exposed publicly\"}"}}
+    alb.ingress.kubernetes.io/tags: Project=webhook-delivery-service
+
+spec:
+  # The IngressClass created by the controller's Helm chart. This is what routes
+  # the OBJECT to the right controller -- without it, no controller claims this
+  # Ingress and it sits forever with no address and no error.
+  ingressClassName: alb
+  rules:
+  - host: webhooks.sndiaye.com
+    http:
+      paths:
+      # 🔴 ORDER IS LOAD-BEARING. The controller turns these into ALB listener
+      # rules with priorities in the order they appear, and the FIRST match wins.
+      # This deny must precede the catch-all below; swap them and '/' matches
+      # /actuator first and the deny never fires.
+      - path: /actuator
+        pathType: Prefix
+        backend:
+          service:
+            name: deny-actuator      # not a real Service -- the name selects the
+            port:                    # actions.<name> annotation above
+              name: use-annotation
+
+      # Prefix '/' -- everything else goes to the producer. There is exactly one
+      # real backend service, so further path routing would be ceremony.
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: producer      # ⚠️ a SERVICE (networking), not a ServiceAccount
+            port:               #    (identity). Different objects, similar names.
+              name: http        # by NAME, matching 05-producer.yaml's port name
