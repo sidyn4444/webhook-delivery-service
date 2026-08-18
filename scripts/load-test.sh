@@ -20,6 +20,15 @@
 #   client, and the only way to tell them apart is to know the client's limit
 #   before you start.
 #
+#   🔴 AND THE PREFLIGHT MUST NOT AIM AT THE SYSTEM UNDER TEST. The first version of
+#   this script fired preflight at /events, which is exactly wrong: if the service
+#   is the bottleneck then the "generator ceiling" it reports is the SERVICE's
+#   ceiling, and the two numbers become the same measurement with different names --
+#   guaranteeing they agree and proving nothing. Preflight therefore aims at
+#   --preflight-url, which defaults to the load-test sink: an nginx that returns 200
+#   and does no work, no queue, no database. Whatever rate comes back is this
+#   laptop's own limit against this network.
+#
 # WHAT IS ACTUALLY BEING MEASURED
 #
 #   NOT "how many 202s can I get". POST /events returns 202 the moment the job is
@@ -36,8 +45,9 @@ set -uo pipefail
 URL="https://webhooks.sndiaye.com"
 RATE=20
 DURATION=60
-SUBSCRIBER="https://httpbin.org/post"
+SUBSCRIBER=""
 PREFLIGHT=0
+PREFLIGHT_URL=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -46,6 +56,7 @@ while [[ $# -gt 0 ]]; do
     --url)        URL="$2"; shift 2 ;;
     --subscriber) SUBSCRIBER="$2"; shift 2 ;;
     --preflight)  PREFLIGHT=1; shift ;;
+    --preflight-url) PREFLIGHT_URL="$2"; shift 2 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
@@ -58,28 +69,45 @@ done
 # result is anywhere near this number, the test measured the generator.
 # --------------------------------------------------------------------------
 if [[ "$PREFLIGHT" == "1" ]]; then
-  echo "PREFLIGHT: firing unpaced for 5s to find the generator's own ceiling..."
+  if [[ -z "$PREFLIGHT_URL" ]]; then
+    echo "--preflight needs --preflight-url pointing at something that does NO WORK" >&2
+    echo "(the load-test sink: an nginx returning 200). Aiming it at /events would" >&2
+    echo "measure the service and call the result a generator ceiling." >&2
+    exit 2
+  fi
+  echo "PREFLIGHT: firing unpaced for 5s at a do-nothing endpoint to find THIS"
+  echo "           machine's ceiling. Target: $PREFLIGHT_URL"
   start=$(python3 -c 'import time;print(time.time())')
   count=0
   end_by=$(python3 -c "import time;print(time.time()+5)")
   while (( $(python3 -c "import time;print(1 if time.time() < $end_by else 0)") )); do
-    for _ in $(seq 1 20); do
-      curl -s -o /dev/null -m 10 -X POST "$URL/events" \
-        -H 'Content-Type: application/json' \
-        -d "{\"event_id\":\"$(uuidgen)\",\"subscriber_url\":\"$SUBSCRIBER\",\"payload\":\"{}\"}" &
+    for _ in $(seq 1 30); do
+      curl -s -o /dev/null -m 10 -X POST "$PREFLIGHT_URL" -d '{}' &
     done
     wait
-    count=$((count + 20))
+    count=$((count + 30))
   done
   elapsed=$(python3 -c "import time;print(round(time.time()-$start,2))")
-  echo "PREFLIGHT: $count requests in ${elapsed}s = $(python3 -c "print(round($count/$elapsed,1))") req/s generator ceiling"
+  CEIL=$(python3 -c "print(round($count/$elapsed,1))")
   echo
+  echo "  GENERATOR CEILING: $count requests in ${elapsed}s = ${CEIL} req/s"
+  echo
+  echo "  ⚠️  Any load-test result within ~30% of ${CEIL}/s is suspect: at that point"
+  echo "      this script is a plausible bottleneck and the number may describe the"
+  echo "      generator rather than the service."
   exit 0
 fi
 
-TOTAL=$(( RATE * DURATION ))
+if [[ -z "$SUBSCRIBER" ]]; then
+  echo "--subscriber is required (the URL workers deliver to)." >&2
+  echo "It must be PUBLIC: the producer's SSRF gate rejects private ranges," >&2
+  echo "including cluster DNS names and ClusterIPs. See load-test-receiver.yaml." >&2
+  exit 2
+fi
+
+CONC="${CONC:-$RATE}"
 echo "=============================================================="
-echo " target rate : ${RATE}/s for ${DURATION}s  (${TOTAL} events)"
+echo " concurrency : ${CONC} workers, back-to-back, for ${DURATION}s"
 echo " endpoint    : $URL/events"
 echo " subscriber  : $SUBSCRIBER"
 echo "=============================================================="
@@ -87,36 +115,47 @@ echo "=============================================================="
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
+# Pre-generate every payload BEFORE the clock starts. uuidgen and JSON assembly are
+# real work, and doing them inside the timed loop measures this laptop's ability to
+# build strings rather than the service's ability to accept them.
+#
+# ⚠️ Each event_id must be UNIQUE: the producer enforces idempotency and rejects a
+# repeat within its window, so a load tool replaying one fixed body would measure the
+# duplicate-rejection path at 100% and report it as success.
+python3 - "$TMP" "$SUBSCRIBER" "$(( CONC * DURATION * 4 ))" <<'PYGEN'
+import json, sys, uuid, os
+tmp, sub, n = sys.argv[1], sys.argv[2], int(sys.argv[3])
+d = os.path.join(tmp, "p"); os.makedirs(d, exist_ok=True)
+for i in range(n):
+    with open(os.path.join(d, f"{i:06d}.json"), "w") as f:
+        json.dump({"event_id": str(uuid.uuid4()), "subscriber_url": sub,
+                   "payload": json.dumps({"i": i})}, f)
+PYGEN
+echo " payloads    : $(ls "$TMP/p" | wc -l | tr -d ' ') pre-generated"
+
 START=$(python3 -c 'import time;print(time.time())')
+END_BY=$(python3 -c "import time;print(time.time()+$DURATION)")
 
-for (( sec=0; sec<DURATION; sec++ )); do
-  slot_start=$(python3 -c 'import time;print(time.time())')
-
-  for (( i=0; i<RATE; i++ )); do
-    {
+worker() {
+  local id=$1
+  while (( $(python3 -c "import time;print(1 if time.time() < $END_BY else 0)") )); do
+    for f in $(ls "$TMP/p" | awk "NR % $CONC == $id" | head -25); do
+      [[ -f "$TMP/p/$f" ]] || continue
       code=$(curl -s -o /dev/null -m 15 -w '%{http_code}' -X POST "$URL/events" \
-        -H 'Content-Type: application/json' \
-        -d "{\"event_id\":\"$(uuidgen)\",\"subscriber_url\":\"$SUBSCRIBER\",\"payload\":\"{\\\"s\\\":$sec}\"}")
+        -H 'Content-Type: application/json' --data-binary "@$TMP/p/$f")
       echo "$code" >> "$TMP/codes"
-    } &
+      rm -f "$TMP/p/$f"
+      (( $(python3 -c "import time;print(1 if time.time() < $END_BY else 0)") )) || break
+    done
   done
-  wait
+}
 
-  # Pace to one batch per second. If the batch already took longer than a second
-  # the generator is behind and cannot hold the requested rate -- reported at the
-  # end rather than silently absorbed.
-  python3 -c "
-import time
-rem = 1.0 - (time.time() - $slot_start)
-if rem > 0: time.sleep(rem)
-"
-  printf '\r  %ds/%ds  sent=%s' "$((sec+1))" "$DURATION" "$(wc -l < "$TMP/codes" | tr -d ' ')"
-done
-echo
+for (( w=0; w<CONC; w++ )); do worker "$w" & done
+wait
 
 ELAPSED=$(python3 -c "import time;print(round(time.time()-$START,2))")
-SENT=$(wc -l < "$TMP/codes" | tr -d ' ')
-OK=$(grep -c '^202$' "$TMP/codes" || true)
+SENT=$(wc -l < "$TMP/codes" 2>/dev/null | tr -d ' '); SENT=${SENT:-0}
+OK=$(grep -c '^202$' "$TMP/codes" 2>/dev/null || true); OK=${OK:-0}
 BAD=$(( SENT - OK ))
 ACTUAL=$(python3 -c "print(round($SENT/$ELAPSED,1))")
 

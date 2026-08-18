@@ -1,0 +1,109 @@
+# ---------------------------------------------------------------------------
+#  In-cluster load generator. TEST FIXTURE, deleted with the load test.
+#
+#  🔴 WHY THIS EXISTS: THE LAPTOP GENERATOR COULD NOT SATURATE THE SYSTEM.
+#
+#  Measured from the laptop (scripts/load-test.sh), 60s per rung:
+#      16 workers -> 78.1 deliveries/s, backlog FLAT AT 0,  p95 5.2ms
+#      24 workers -> 108.7 deliveries/s, backlog peaked 12 and SELF-DRAINED, p95 5.1ms
+#  ...against a measured generator ceiling of 122/s. At 108.7/s the generator was at
+#  89% of its own limit and producing 125 client-side failures (empty curl responses,
+#  with the producer's own metrics showing NO 4xx and NO 5xx -- the requests never
+#  arrived). The service was never the constraint.
+#
+#  ⚠️ A capacity number produced by a saturated generator is a measurement OF THE
+#  GENERATOR. "At least 108/s" is honest but leaves the real limit unknown.
+#
+#  WHAT THIS REMOVES: the laptop's CPU and process-spawn cost, the home network, the
+#  internet round trip, and the ALB hop -- by posting to the producer's ClusterIP
+#  Service from a pod on the same cluster. What remains under test is exactly the
+#  system: producer -> Redis -> worker pool -> subscriber.
+#
+#  ⚠️ STATED BOUNDARY: this therefore does NOT exercise the ALB, TLS termination or
+#  the public path. Those were proven separately at 33b and are not what a throughput
+#  number is about. The delivery leg still goes worker -> NAT -> sink ALB -> pod, so
+#  the LATENCY still includes a real network round trip.
+#
+#  Threads + urllib rather than curl processes: a thread costs microseconds to reuse,
+#  a process costs milliseconds to spawn, and that spawn cost is precisely what
+#  capped the laptop generator.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: loadgen-script
+  namespace: webhooks
+data:
+  gen.py: |
+    import json, os, sys, threading, time, urllib.request, uuid
+    from collections import Counter
+
+    URL   = os.environ["TARGET_URL"]
+    SUB   = os.environ["SUBSCRIBER_URL"]
+    CONC  = int(os.environ.get("CONCURRENCY", "50"))
+    DUR   = int(os.environ.get("DURATION", "60"))
+    # 🔴 TARGET_RATE (events/sec, 0 = unlimited). CONCURRENCY ALONE CANNOT CONTROL THE
+    # INPUT RATE HERE, which is the finding that forced this option: measured in-cluster,
+    # even THREE threads drove 576 accepts/sec, because the producer's accept path is
+    # ~200x faster than a delivery (no TLS, no ALB, one Redis LPUSH). So every
+    # concurrency setting tested saturated the worker pool and the backlog grew.
+    #
+    # A growing backlog measures CAPACITY (how fast workers drain) but cannot demonstrate
+    # a SUSTAINED rate -- for that the input has to be held BELOW capacity, and that needs
+    # a rate limit rather than a thread count.
+
+    end_by = time.time() + DUR
+    counts = Counter()
+    lock = threading.Lock()
+
+    RATE  = float(os.environ.get("TARGET_RATE", "0"))
+    # Per-thread interval. Each thread paces itself to RATE/CONC, so the fleet lands on
+    # RATE overall without any shared clock or lock between threads.
+    interval = (CONC / RATE) if RATE > 0 else 0.0
+
+    def worker():
+        local = Counter()
+        next_at = time.time()
+        while time.time() < end_by:
+            if interval:
+                next_at += interval
+                delay = next_at - time.time()
+                if delay > 0:
+                    time.sleep(delay)
+                elif delay < -1.0:
+                    # More than a second behind: this thread cannot hold its share, so the
+                    # requested rate is not being applied. Resync rather than accumulate a
+                    # silent debt that would make the reported rate a fiction.
+                    next_at = time.time()
+                    local["BEHIND"] += 1
+            body = json.dumps({
+                "event_id": str(uuid.uuid4()),
+                "subscriber_url": SUB,
+                "payload": '{"x":1}',
+            }).encode()
+            req = urllib.request.Request(
+                URL, data=body, method="POST",
+                headers={"Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(req, timeout=15) as r:
+                    local[r.status] += 1
+            except urllib.error.HTTPError as e:
+                local[e.code] += 1
+            except Exception as e:
+                local[type(e).__name__] += 1
+        with lock:
+            counts.update(local)
+
+    start = time.time()
+    threads = [threading.Thread(target=worker, daemon=True) for _ in range(CONC)]
+    for t in threads: t.start()
+    for t in threads: t.join()
+    elapsed = time.time() - start
+
+    total = sum(counts.values())
+    ok = counts.get(202, 0)
+    print(f"concurrency={CONC} duration={DUR}s elapsed={elapsed:.2f}s")
+    print(f"sent={total} accepted202={ok} other={total-ok}")
+    print(f"ACCEPT_RATE={total/elapsed:.1f}/s")
+    for k, v in sorted(counts.items(), key=lambda kv: str(kv[0])):
+        print(f"  {k}: {v}")
