@@ -121,7 +121,7 @@ spec:
 
       containers:
       - name: producer
-        image: 245976211964.dkr.ecr.us-east-1.amazonaws.com/webhook-producer:0.3.0
+        image: 245976211964.dkr.ecr.us-east-1.amazonaws.com/webhook-producer:0.4.0
         # 🔴 A FULLY-QUALIFIED REGISTRY HOST, WHICH IS WHY THIS ONE WORKS AND THE
         # LOCAL ONE COULD NOT. `webhook-producer:0.2.0` has no host, so Kubernetes
         # assumes Docker Hub -- fine on minikube, where the image was side-loaded
@@ -134,8 +134,22 @@ spec:
         # authenticates to ECR as the machine it runs on. That is also why the
         # permission is account-wide rather than per-repository.
         #
-        # 0.3.0, not a rebuild of 0.2.0: the tags are IMMUTABLE in ECR, and 23b
-        # already measured that a node holding a tag will not reliably replace it.
+        # 0.4.0 (32c), not a rebuild of 0.3.0: the tags are IMMUTABLE in ECR, and
+        # 23b already measured that a node holding a tag will not reliably replace it.
+        #
+        # 🔴 THE BUMP IS LOAD-BEARING HERE IN A WAY IT HAS NOT BEEN BEFORE, because
+        # this time the difference is INVISIBLE FROM OUTSIDE THE PROCESS. 0.3.0 and
+        # 0.4.0 serve identical endpoints, pass identical probes and return identical
+        # responses; the only difference is which SERIES appear on
+        # /actuator/prometheus. A stale 0.3.0 running under a 0.4.0 label would look
+        # completely healthy and would simply be missing the metrics every Session 6
+        # dashboard is built on -- and the symptom would be an empty panel, which
+        # reads as "nothing is happening" rather than as "wrong image".
+        #
+        # ⚠️ Those 0.3.0 images still exist on this laptop from Session 5 while the
+        # ECR repository that held them has been DELETED. Same tag, same name, and
+        # nothing remote to compare against -- exactly the unfalsifiable state the
+        # rule exists to prevent.
         imagePullPolicy: IfNotPresent
 
         ports:

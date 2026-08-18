@@ -87,14 +87,16 @@ spec:
 
       containers:
       - name: worker
-        image: 245976211964.dkr.ecr.us-east-1.amazonaws.com/webhook-worker:0.3.0
+        image: 245976211964.dkr.ecr.us-east-1.amazonaws.com/webhook-worker:0.4.0
         # 🔴 FULLY-QUALIFIED REGISTRY HOST. On minikube the image was side-loaded onto
         # the node and never pulled; on EKS each node's kubelet pulls, so the image
         # must live somewhere the NODE can reach. ECR is OUTSIDE the VPC, so that
         # pull leaves through the NAT Gateway. No imagePullSecret anywhere: the node's
         # IAM role carries AmazonEC2ContainerRegistryReadOnly, so the kubelet
         # authenticates as the machine it runs on. See 05-producer.yaml for the full
-        # reasoning, including why this is 0.3.0 rather than a rebuild of 0.2.0.
+        # reasoning, including why this is 0.4.0 rather than a rebuild of 0.3.0 --
+        # which matters more at 32c than at any earlier bump, because the difference
+        # between the two images is invisible except in the metric series they expose.
         imagePullPolicy: IfNotPresent
 
         ports:
