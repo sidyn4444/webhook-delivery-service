@@ -6,12 +6,25 @@
 ![Spring Boot](https://img.shields.io/badge/Spring%20Boot-3.3-brightgreen)
 ![Redis](https://img.shields.io/badge/Redis-7-red)
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-blue)
-![Docker](https://img.shields.io/badge/Docker-Compose-2496ED)
+![Docker](https://img.shields.io/badge/Docker-distroless-2496ED)
+![Kubernetes](https://img.shields.io/badge/Kubernetes-EKS%201.34-326CE5)
+![AWS](https://img.shields.io/badge/AWS-ElastiCache%20%C2%B7%20RDS%20%C2%B7%20ALB-FF9900)
+![Prometheus](https://img.shields.io/badge/Prometheus-Grafana-E6522C)
 
 > A self-directed project built to work through distributed-systems fundamentals — delivery
 > semantics, reliable queueing, failure classification, and idempotency — as production code
-> rather than as reading. **The delivery engine is complete and running locally.**
-> Containerization and an AWS EKS deployment are in progress.
+> rather than as reading. **Deployed and measured on AWS EKS.**
+
+**Measured on EKS** — 2 × `t3.medium`, 2 producer pods, 3 worker pods:
+
+| | |
+|---|---|
+| **Sustained delivery throughput** | **178 deliveries/sec** |
+| **Delivery latency** | **p50 2.5 ms · p95 4.8 ms · p99 5.3 ms** |
+| **Worker-failure recovery** | **34 s to full pool, zero events lost** |
+
+"Sustained" means the queue backlog did not grow. Full method, the four independent capacity
+measurements, and every boundary that would invalidate a number: **[BENCHMARKS.md](BENCHMARKS.md)**.
 
 ---
 
@@ -42,9 +55,14 @@ each solve internally.
 | HMAC-SHA256 signing, per attempt, with a stable event id for deduplication | ✅ |
 | SSRF validation — every URL judged by the **IP it resolves to** | ✅ |
 | Durable delivery-attempt log in PostgreSQL (metadata only, never payloads) | ✅ |
-| JUnit 5 + Mockito suite with JaCoCo coverage | 🚧 in progress |
-| Docker images + Kubernetes manifests | ○ next |
-| AWS EKS deployment, Prometheus + Grafana dashboards | ○ planned |
+| JUnit 5 + Mockito suite — **219 tests** across three modules | ✅ |
+| Multi-stage **distroless** images, non-root, built for `linux/amd64` | ✅ |
+| Kubernetes manifests — Deployments, Services, ConfigMap, Secrets, HPA | ✅ |
+| **AWS EKS** — nodes in private subnets, ElastiCache + RDS, images from ECR | ✅ |
+| **HTTPS at an ALB** with an ACM certificate, HTTP→HTTPS redirect | ✅ |
+| **IRSA** — the load balancer controller assumes an IAM role, no static keys | ✅ |
+| **Prometheus + Grafana** — delivery throughput, latency quantiles, DLQ depth, pod health | ✅ |
+| Load test and documented chaos test with measured numbers | ✅ |
 
 ## Architecture
 
@@ -86,6 +104,51 @@ re-queues them, which is what makes a worker dying mid-delivery survivable.
 inbound traffic, the workers with delivery backlog. Redis is the only thing they share, which is
 what stops a slow subscriber from ever slowing down event ingestion.
 
+⚠️ **And the load test showed which one is actually the constraint:** the producer accepted
+**576 events/sec** while three workers delivered **196/sec**. The bottleneck is the worker pool,
+so the scaling lever is worker replicas — an autoscaler on the *producer* would not have helped.
+
+### On AWS
+
+```
+   internet
+      │  HTTPS (ACM certificate, TLS 1.3, HTTP→HTTPS redirect)
+      ▼
+ ┌──────────────────┐   /actuator → fixed-response 403 at the load balancer
+ │  ALB  (public    │   everything else → producer POD IPs directly (target-type: ip)
+ │       subnets)   │   subnets discovered by the kubernetes.io/role/elb TAG, not hardcoded
+ └────────┬─────────┘
+          │
+ ┌────────▼──────────────────────────────────────────────────────┐
+ │  EKS 1.34 — nodes in PRIVATE subnets, no public IP at all     │
+ │                                                                │
+ │   producer × 2 ──┐                        ┌── Prometheus       │
+ │   worker   × 3 ──┼── scraped per POD IP ──┤   + Grafana        │
+ │                  │  (ServiceMonitor +     └── kube-state-metrics
+ │                  │   PodMonitor)                                │
+ └──────┬───────────┴──────────────┬─────────────────────────────┘
+        │ TLS + AUTH               │ TLS
+ ┌──────▼────────┐        ┌────────▼────────┐        ┌──────────────┐
+ │  ElastiCache  │        │  RDS PostgreSQL │        │ NAT Gateway  │
+ │  Redis 7.1    │        │  16.14          │        │ (outbound    │
+ │  private      │        │  private        │        │  only)       │
+ └───────────────┘        └─────────────────┘        └──────┬───────┘
+                                                             │
+                                        worker → subscriber ─┘
+```
+
+🔴 **"Private subnet" is a stronger claim than "security group", and both are used.** A security
+group is a rule that can be written wrongly; a missing route is not a rule. The datastores accept
+traffic **only from the node security group** — verified as a group reference, not a CIDR — *and*
+sit in subnets with no route to the internet. Outbound delivery leaves through a NAT Gateway, so
+a subscriber sees the NAT's address and never a node's.
+
+**The worker has no Service, deliberately** — nothing calls a worker. That is why Prometheus
+discovers producers with a `ServiceMonitor` and workers with a `PodMonitor`: inventing a Service
+purely so a scraper could find it would undo a considered design decision for a scraper's
+convenience. Both scrape pod IPs, so three workers produce three independent time series rather
+than one blended average.
+
 ## Design decisions
 
 | Decision | Why |
@@ -123,6 +186,24 @@ Every claim above was verified by *running* the failure, not by reasoning about 
 - **Payloads never appear in application logs or in the delivery-attempt table**, asserted by
   counting a unique marker in both, with a line-count sanity check so a zero can't come from an
   empty file.
+
+### And again on EKS, under load
+
+The local failure tests above were repeated on a real cluster with the load generator running:
+
+- **A worker killed with `--grace-period=0` while holding three in-flight jobs lost nothing.**
+  `webhook_processing_depth` read **3 at the instant of the kill**. A *surviving* worker's log
+  then shows `RECLAIMED event 08c7f640-… — no worker completed it within 60s, re-queued`, and
+  that event has **exactly one row** in PostgreSQL. No loss, and no duplicate.
+- **Over a full chaos run: 10,800 events accepted → 10,800 delivery attempts → 0 dead-lettered.**
+- 🔴 **The recovery claim is deliberately split in two, because only half of it is this system's
+  doing.** "The pool returned to 3/3 in 34 s" is a statement about Kubernetes — any Deployment
+  replaces a missing pod. **"No event was lost" is the reliable-queue implementation**: a job the
+  dead worker had already taken off the queue is invisible to Kubernetes, and nothing about
+  replacing a pod puts it back.
+- **The SSRF guard was re-verified against the cloud it now runs in.** From the public endpoint,
+  a subscriber URL of `169.254.169.254` — the AWS instance-metadata address — returns `400`, as
+  do the cluster's own DNS names and ClusterIPs, while a public URL still returns `202`.
 
 ## Security
 
@@ -212,8 +293,13 @@ only `NULL` says which happened.
 Redis (Lettuce) · Redis 7 incl. sorted sets and Lua scripting · Spring Data JPA / Hibernate ·
 PostgreSQL 16 · Flyway · JUnit 5 · Mockito · JaCoCo · Docker Compose
 
-**Planned** — Docker (multi-stage, distroless, non-root) · Kubernetes · Helm · AWS EKS,
-ElastiCache, RDS, ALB Ingress, ACM, Secrets Manager · Micrometer · Prometheus · Grafana
+**Infrastructure** — Docker (multi-stage, distroless, non-root) · Kubernetes 1.34 · Helm ·
+AWS EKS · ElastiCache Redis · RDS PostgreSQL · ECR · ALB Ingress Controller · ACM · Route 53 ·
+IRSA · Micrometer · Prometheus · Grafana
+
+**Deliberately not used** — Terraform (the cluster is defined in `deploy/cluster.yaml` and
+created with `eksctl`; infrastructure-as-code was out of scope) · service mesh · CI/CD to the
+cluster · AWS Secrets Manager (Kubernetes Secrets are used instead — see *Honest limitations*)
 
 ## Roadmap
 
@@ -222,7 +308,26 @@ ElastiCache, RDS, ALB Ingress, ACM, Secrets Manager · Micrometer · Prometheus 
 | Foundations | System design, data model, failure modes, security architecture | ✅ Complete |
 | Core pipeline | `POST /events` → Redis → worker → HTTP delivery → PostgreSQL log | ✅ Complete |
 | Resilience & security | Retry with jitter · DLQ · multi-worker recovery sweep · HMAC signing · SSRF validation | ✅ Complete |
-| Test suite | JUnit 5 + Mockito across all three modules, JaCoCo-tracked | 🚧 In progress |
-| Containerization | Multi-stage distroless images · Kubernetes manifests · local cluster deploy | ○ Next |
-| Cloud deployment | AWS EKS · ElastiCache + RDS in private subnets · ALB Ingress · HTTPS · IRSA | ○ Planned |
-| Observability | Prometheus + Grafana dashboards · load testing · documented chaos test | ○ Planned |
+| Test suite | JUnit 5 + Mockito across all three modules, JaCoCo-tracked | ✅ Complete |
+| Containerization | Multi-stage distroless images · Kubernetes manifests · local cluster deploy | ✅ Complete |
+| Cloud deployment | AWS EKS · ElastiCache + RDS in private subnets · ALB Ingress · HTTPS · IRSA | ✅ Complete |
+| Observability | Prometheus + Grafana dashboards · load testing · documented chaos test | ✅ Complete |
+
+## Honest limitations
+
+Things a reviewer would find, listed here rather than left to be discovered:
+
+- **The application pods do not use IRSA.** Only the AWS Load Balancer Controller does. The app
+  reads its credentials from Kubernetes Secrets. AWS Secrets Manager was scoped out.
+- **There is no alerting.** Alertmanager is deliberately disabled — the stack is dashboards-only.
+  A dashboard shows you; an alert tells you. Nothing here would wake anyone up.
+- **Delivery latency cannot be broken down per subscriber.** The `uri` and `client.name` labels
+  are collapsed to a constant, because subscriber URLs are unbounded and each unique pair cost a
+  measured 54 Prometheus series per pod. Per-subscriber timing lives in the PostgreSQL log
+  instead, where a row is cheap in the way a time series is not.
+- **The control plane is not observable.** On EKS, `etcd`, the scheduler and the controller
+  manager run in AWS's account — you get an SLA instead of a dashboard.
+- **No infrastructure-as-code.** The cluster is reproducible from `deploy/cluster.yaml`, but the
+  ALB, its target groups and its security groups are created by a controller and exist in no file.
+- **The load test's subscriber is an nginx behind an ALB**, not a third-party endpoint. Measuring
+  against `httpbin.org` gave a p95 of 373 ms, almost all of it someone else's server.
