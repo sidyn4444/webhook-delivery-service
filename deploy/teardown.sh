@@ -168,7 +168,7 @@ fi
 # This is the step whose ORDER actually matters. The ALB is created by a controller
 # reacting to the Ingress object; removing the Ingress is what tells it to remove the
 # ALB. Skipping this leaves a load balancer nothing will ever clean up.
-log "1/7  Ingress (releases the ALB) — must happen while the cluster is UP"
+log "1/10  Ingress (releases the ALB) — must happen while the cluster is UP"
 if kubectl --request-timeout=10s get ns "$K8S_NAMESPACE" >/dev/null 2>&1; then
   kubectl delete ingress --all -n "$K8S_NAMESPACE" --ignore-not-found --timeout=120s 2>&1 | sed 's/^/  /'
   info "waiting 60s for the controller to delete the ALB..."
@@ -178,8 +178,45 @@ else
   info "no reachable cluster / namespace — skipping"
 fi
 
-# STEP 2 — the certificate, now that nothing is using it.
-log "2/7  ACM certificate for $CERT_DOMAIN"
+# STEP 2 — the DNS records, before the things they point at are gone.
+#
+# 🔴 WHY THIS STEP EXISTS AT ALL: nothing here costs money, and that is exactly why
+# it was missing. Two records were created in Task 30 and neither is deleted by any
+# other step:
+#   * an ALIAS A record  webhooks.sndiaye.com -> the ALB
+#   * an ACM validation CNAME  _<hash>.webhooks.sndiaye.com
+# Step 1 deletes the ALB and step 3 deletes the certificate, leaving BOTH records
+# pointing at things that no longer exist -- a "dangling" record. The alias one is
+# the one that matters: it names an ELB by name in a known region, and an alias to a
+# load balancer someone else could later create is the classic subdomain-takeover
+# shape. The hosted zone deliberately SURVIVES teardown, so these records would
+# otherwise outlive every rebuild and accumulate.
+#
+# ⚠️ Route 53 DELETE requires the record's EXACT current value, so each record is
+# read back and echoed into the change batch rather than reconstructed from memory.
+log "2/10  Route 53 records for $CERT_DOMAIN (dangling DNS, not a cost)"
+ZONE_ID=$(aws route53 list-hosted-zones \
+            --query "HostedZones[?Name=='${CERT_DOMAIN#*.}.'].Id | [0]" --output text 2>/dev/null | sed 's#/hostedzone/##')
+if [[ -n "$ZONE_ID" && "$ZONE_ID" != "None" ]]; then
+  RECS=$(aws route53 list-resource-record-sets --hosted-zone-id "$ZONE_ID" --output json 2>/dev/null)
+  BATCH=$(CERT_DOMAIN="$CERT_DOMAIN" python3 -c '
+import json,sys,os
+d=json.load(sys.stdin); dom=os.environ["CERT_DOMAIN"]
+ch=[{"Action":"DELETE","ResourceRecordSet":r} for r in d["ResourceRecordSets"]
+    if r["Name"].rstrip(".").endswith(dom) and r["Type"] not in ("NS","SOA")]
+print(json.dumps({"Changes":ch}) if ch else "")' <<<"$RECS")
+  if [[ -n "$BATCH" ]]; then
+    try "dns records under $CERT_DOMAIN" aws route53 change-resource-record-sets \
+        --hosted-zone-id "$ZONE_ID" --change-batch "$BATCH"
+  else
+    info "no records under $CERT_DOMAIN — already gone"
+  fi
+else
+  info "no hosted zone for ${CERT_DOMAIN#*.} — nothing to clean"
+fi
+
+# STEP 3 — the certificate, now that nothing is using it.
+log "3/10  ACM certificate for $CERT_DOMAIN"
 CERT_ARN=$(aws acm list-certificates --region "$REGION" \
              --query "CertificateSummaryList[?DomainName=='$CERT_DOMAIN'].CertificateArn | [0]" \
              --output text 2>/dev/null)
@@ -192,19 +229,74 @@ fi
 # STEP 3 — the datastores. These live INSIDE the VPC eksctl created, so they must be
 # fully deleted before step 5 can remove that VPC. Both deletes are asynchronous and
 # take several minutes, which is why the script waits instead of racing ahead.
-log "3/7  ElastiCache + RDS (must finish before the VPC can go)"
-try "elasticache $REDIS_ID" aws elasticache delete-cache-cluster --region "$REGION" --cache-cluster-id "$REDIS_ID"
+log "4/10  ElastiCache + RDS (must finish before the VPC can go)"
+# 🔴 A REPLICATION GROUP, NOT A CACHE CLUSTER — and `delete-cache-cluster` will NOT
+# remove one. Changed at 27a, after the API refused `--transit-encryption-enabled` on
+# `create-cache-cluster` with "Encryption feature is not supported for engine REDIS".
+# Encrypted, password-protected Redis on ElastiCache only exists as a replication
+# group, even when it is a single node with no replica. So the shape of the resource
+# was forced by the security requirement, not chosen.
+#
+# ⚠️ The failure this line prevents is a quiet one: the old command returns a
+# not-found error, `try` treats not-found as success and prints a green line, and the
+# Redis node keeps running. A teardown that reports success while the thing survives
+# is worse than one that fails loudly.
+#
+# --no-retain-primary-cluster deletes the primary too. Without it AWS keeps the node
+# as a standalone cache cluster — still billing, and now under a different name.
+try "elasticache $REDIS_ID" aws elasticache delete-replication-group --region "$REGION" \
+      --replication-group-id "$REDIS_ID" --no-retain-primary-cluster
 try "rds $DB_ID" aws rds delete-db-instance --region "$REGION" --db-instance-identifier "$DB_ID" \
       --skip-final-snapshot --delete-automated-backups
 
 info "waiting for both to finish deleting (several minutes)..."
-aws elasticache wait cache-cluster-deleted --region "$REGION" --cache-cluster-id "$REDIS_ID" 2>/dev/null && ok "elasticache gone"
+aws elasticache wait replication-group-deleted --region "$REGION" --replication-group-id "$REDIS_ID" 2>/dev/null && ok "elasticache gone"
 aws rds wait db-instance-deleted --region "$REGION" --db-instance-identifier "$DB_ID" 2>/dev/null && ok "rds gone"
 
 # STEP 4 — the subnet groups, which reference the subnets and so must precede the VPC.
-log "4/7  Subnet groups"
+log "5/10  Subnet groups"
 try "cache subnet group" aws elasticache delete-cache-subnet-group --region "$REGION" --cache-subnet-group-name "$CACHE_SUBNET_GROUP"
 try "db subnet group"    aws rds delete-db-subnet-group --region "$REGION" --db-subnet-group-name "$DB_SUBNET_GROUP"
+
+# --- our own security groups (added at 27a) ---------------------------------------
+#
+# 🔴 THESE COST NOTHING AND ARE STILL LOAD-BEARING FOR THE TEARDOWN. A security group
+# we created lives in the VPC that eksctl owns, but eksctl's CloudFormation stack has
+# no record of it. Step 6 therefore tries to delete a VPC that still has a member it
+# does not know about, the delete FAILS, and the stack rolls back with the VPC intact
+# — and the NAT Gateway inside it still billing at ~$1.10/day.
+#
+# The failure is not silent, but it is misleading: the error names the VPC, not the
+# security group, so the thing that must be removed is never mentioned by the thing
+# that broke. Same shape as the ALB in step 1 — a resource created outside the tool
+# that owns the environment is exactly what a cleanup built from memory misses.
+#
+# ORDERING: this must run AFTER step 3, because a security group attached to a live
+# ElastiCache or RDS network interface refuses to delete, and BEFORE step 6.
+#
+# 🔴 SCOPED BY NAME, NOT BY TAG — and the first version of this step got it wrong.
+# `cluster.yaml` sets `tags: {Project: webhook-delivery}`, so eksctl stamps OUR tag
+# onto every resource IT creates. Filtering on that tag returned three security
+# groups: ours plus eksctl's ClusterSharedNodeSecurityGroup and its
+# ControlPlaneSecurityGroup — CloudFormation-owned objects this script must not
+# touch. The tag says which project a thing belongs to; it does NOT say who made it,
+# and a cleanup needs the second question answered.
+#
+# The name filter uses the same PREFIX contract as $REDIS_ID and $DB_ID, which is how
+# the rest of this script identifies its own resources. Verified read-only before
+# being relied on: `webhook-*-sg` matched exactly ours, and a deliberately bogus
+# pattern returned 0, so the filter discriminates rather than always matching.
+log "6/10  Our security groups (free, but they block the VPC delete)"
+OUR_SGS=$(aws ec2 describe-security-groups --region "$REGION" \
+            --filters "Name=group-name,Values=${PREFIX}-*-sg" \
+            --query "SecurityGroups[].GroupId" --output text 2>/dev/null)
+if [[ -n "$OUR_SGS" ]]; then
+  for sg in $OUR_SGS; do
+    try "security group $sg" aws ec2 delete-security-group --region "$REGION" --group-id "$sg"
+  done
+else
+  info "no tagged security groups — already gone"
+fi
 
 # STEP 5 — stray EC2 instances carrying our project tag.
 #
@@ -216,7 +308,13 @@ try "db subnet group"    aws rds delete-db-subnet-group --region "$REGION" --db-
 # one line shorter and would destroy unrelated things this account may hold later. A
 # teardown script that can damage something outside its own project is worse than no
 # teardown script, because it will eventually be run by someone in a hurry.
-log "5/7  Stray EC2 instances tagged $TAG_KEY=$TAG_VALUE"
+# ⚠️ MEASURED CONSEQUENCE OF THIS STEP RUNNING BEFORE STEP 8: the cluster's own
+# nodes carry this tag, so this terminates them out from under the VPC CNI and
+# orphans the secondary ENIs it attached for pod IPs — which then blocks a subnet
+# delete and fails the stack in step 8. Step 8 now detects and repairs that. Left in
+# this order deliberately: its real job is catching instances eksctl does NOT know
+# about, and those must go before the VPC delete is attempted, not after.
+log "7/10  Stray EC2 instances tagged $TAG_KEY=$TAG_VALUE"
 STRAY=$(aws ec2 describe-instances --region "$REGION" \
           --filters "Name=tag:$TAG_KEY,Values=$TAG_VALUE" \
                     "Name=instance-state-name,Values=pending,running,stopping,stopped" \
@@ -234,17 +332,129 @@ fi
 # VPC, its subnets, the internet gateway, the IAM OIDC provider, and THE NAT GATEWAY.
 # --wait makes it block until AWS reports the CloudFormation stacks actually deleted,
 # rather than until the request was accepted.
-log "6/7  EKS cluster $CLUSTER  (takes the VPC and the NAT Gateway with it)"
+log "8/10  EKS cluster $CLUSTER  (takes the VPC and the NAT Gateway with it)"
+
+# 🔴 THE VPC ID MUST BE CAPTURED BEFORE THE CLUSTER GOES. The recovery block below
+# needs it, and once the cluster is deleted there is nothing left to ask.
+CLUSTER_VPC=$(aws eks describe-cluster --region "$REGION" --name "$CLUSTER" \
+                --query 'cluster.resourcesVpcConfig.vpcId' --output text 2>/dev/null)
+
 if aws eks describe-cluster --region "$REGION" --name "$CLUSTER" >/dev/null 2>&1; then
+  # ⚠️ `set -o pipefail` is on, so this captures eksctl's status, not sed's.
   eksctl delete cluster --name "$CLUSTER" --region "$REGION" --wait 2>&1 | sed 's/^/  /'
-  ok "cluster deleted"
+  EKSCTL_RC=${PIPESTATUS[0]}
+
+  # ---------------------------------------------------------------------------
+  # 🔴 THIS BLOCK EXISTS BECAUSE THE SCRIPT ONCE PRINTED "cluster deleted" WHILE
+  # eksctl WAS PRINTING "Error: failed to delete cluster with nodegroup(s)".
+  #
+  # The old line was an UNCONDITIONAL `ok` — it reported the outcome of the step
+  # rather than the outcome of the command, so the single most expensive delete in
+  # the script could fail silently and the final inventory (which counts only
+  # HOURLY-BILLED things) would still read 0 and look like success.
+  #
+  # THE UNDERLYING CAUSE, measured: step 7 terminates the nodes directly, and the
+  # AWS VPC CNI attaches SECONDARY ENIs to each node to hand out pod IPs. Killing
+  # the instance out from under the CNI leaves those ENIs behind in state
+  # `available`, and an ENI in a subnet blocks that subnet from being deleted,
+  # which fails the whole CloudFormation stack and orphans the VPC.
+  #
+  # Free — a VPC, a subnet and a detached ENI all cost nothing — which is exactly
+  # why an inventory that only counts billable things cannot detect it.
+  # ---------------------------------------------------------------------------
+  if [[ "$EKSCTL_RC" -ne 0 ]]; then
+    warn "eksctl exited $EKSCTL_RC — attempting the known CNI-ENI recovery"
+    if [[ -n "$CLUSTER_VPC" && "$CLUSTER_VPC" != "None" ]]; then
+      ORPHAN_ENIS=$(aws ec2 describe-network-interfaces --region "$REGION" \
+                      --filters "Name=vpc-id,Values=$CLUSTER_VPC" "Name=status,Values=available" \
+                      --query "NetworkInterfaces[?starts_with(Description,'aws-K8S-')].NetworkInterfaceId" \
+                      --output text 2>/dev/null)
+      for eni in $ORPHAN_ENIS; do
+        try "orphaned CNI interface $eni" aws ec2 delete-network-interface \
+            --region "$REGION" --network-interface-id "$eni"
+      done
+
+      # -----------------------------------------------------------------------
+      # 🔴 THE SECOND BLOCKER, AND IT IS A DIFFERENT ONE. Clearing the ENIs let
+      # the subnet delete and moved the failure UP a level, to the VPC itself:
+      #   "The vpc 'vpc-...' has dependencies and cannot be deleted"
+      # The dependency was `eks-cluster-sg-<cluster>-<id>` -- a security group
+      # created by the EKS SERVICE, not by this CloudFormation stack, so the
+      # stack has no record of it and will never remove it.
+      #
+      # ⚠️ It also does not match step 6's `${PREFIX}-*-sg` pattern, so that step
+      # could not have caught it either. Matched here on the name EKS actually
+      # uses, and `default` is excluded because a VPC's default group cannot be
+      # deleted and disappears with the VPC.
+      # -----------------------------------------------------------------------
+      LEFTOVER_SGS=$(aws ec2 describe-security-groups --region "$REGION" \
+                       --filters "Name=vpc-id,Values=$CLUSTER_VPC" \
+                       --query "SecurityGroups[?GroupName!='default'].GroupId" \
+                       --output text 2>/dev/null)
+      for sg in $LEFTOVER_SGS; do
+        try "leftover security group $sg" aws ec2 delete-security-group \
+            --region "$REGION" --group-id "$sg"
+      done
+    fi
+    # ⚠️ MEASURED: the first real recovery needed TWO passes, because clearing the
+    # ENIs only moved the failure from the subnet up to the VPC. Each pass deletes
+    # what the previous failure exposed, so the retry loops rather than assuming one
+    # round is enough. Bounded at 3 -- a loop that cannot give up is its own outage.
+    STACK_GONE=0
+    for attempt in 1 2 3; do
+      info "retrying the CloudFormation stack delete (pass $attempt)..."
+      aws cloudformation delete-stack --region "$REGION" --stack-name "eksctl-${CLUSTER}-cluster" >/dev/null 2>&1
+      if aws cloudformation wait stack-delete-complete --region "$REGION" \
+           --stack-name "eksctl-${CLUSTER}-cluster" 2>/dev/null; then
+        STACK_GONE=1; break
+      fi
+      info "pass $attempt did not finish — clearing whatever it exposed"
+      for sg in $(aws ec2 describe-security-groups --region "$REGION" \
+                    --filters "Name=vpc-id,Values=$CLUSTER_VPC" \
+                    --query "SecurityGroups[?GroupName!='default'].GroupId" --output text 2>/dev/null); do
+        try "leftover security group $sg" aws ec2 delete-security-group --region "$REGION" --group-id "$sg"
+      done
+    done
+    if [[ "$STACK_GONE" -eq 1 ]]; then
+      ok "cluster deleted (after ENI recovery)"
+    else
+      warn "CLUSTER STACK STILL NOT DELETED — the VPC is orphaned. Nothing is billing,"
+      warn "but inspect: aws cloudformation describe-stack-events --stack-name eksctl-${CLUSTER}-cluster"
+    fi
+  else
+    ok "cluster deleted"
+  fi
 else
   info "cluster $CLUSTER not found — already gone"
 fi
 
-# STEP 6 — ECR. No VPC dependency, so it could go anywhere; --force is required
+# STEP 7 — ECR. No VPC dependency, so it could go anywhere; --force is required
 # because a repository containing images refuses to delete without it.
-log "7/7  ECR repositories"
+# STEP 9 — the IAM policy created by hand for the load balancer controller.
+#
+# ⚠️ ORDER: this MUST come after the cluster delete. `eksctl delete cluster` removes
+# the iamserviceaccount CloudFormation stack, and that stack owns the ROLE the policy
+# is attached to. A policy with a live attachment cannot be deleted, so running this
+# earlier fails with DeleteConflict.
+#
+# Not billable -- IAM is free. It is here because a policy nobody uses is one more
+# thing granting 80 actions in this account, and because a rebuild recreates it and
+# would otherwise hit EntityAlreadyExists.
+log "9/10  IAM policy for the load balancer controller (free, but it accumulates)"
+LBC_POLICY_ARN=$(aws iam list-policies --scope Local \
+                   --query "Policies[?PolicyName=='AWSLoadBalancerControllerIAMPolicy'].Arn | [0]" \
+                   --output text 2>/dev/null)
+if [[ -n "$LBC_POLICY_ARN" && "$LBC_POLICY_ARN" != "None" ]]; then
+  for r in $(aws iam list-entities-for-policy --policy-arn "$LBC_POLICY_ARN" \
+               --query "PolicyRoles[].RoleName" --output text 2>/dev/null); do
+    try "detach policy from role $r" aws iam detach-role-policy --role-name "$r" --policy-arn "$LBC_POLICY_ARN"
+  done
+  try "iam policy AWSLoadBalancerControllerIAMPolicy" aws iam delete-policy --policy-arn "$LBC_POLICY_ARN"
+else
+  info "no load balancer controller policy — already gone"
+fi
+
+log "10/10  ECR repositories"
 for repo in "${ECR_REPOS[@]}"; do
   try "ecr $repo" aws ecr delete-repository --region "$REGION" --repository-name "$repo" --force
 done
