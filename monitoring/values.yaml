@@ -107,9 +107,22 @@ prometheus:
         memory: 700Mi
 
 grafana:
-  # Left at the chart's default admin password (`prom-operator`). Acceptable ONLY
-  # because Grafana is a ClusterIP with no Ingress — unreachable without an explicit
-  # kubectl port-forward from this laptop. It is not a secret we chose or committed.
+  # ⚠️ CORRECTED AT 34d, AFTER MEASURING. This comment previously claimed the admin
+  # password was left at the chart's documented default of `prom-operator`. IT IS NOT.
+  # Chart 88.2.0 GENERATES a random 40-character password into the `monitoring-grafana`
+  # Secret at install time, and `prom-operator` is rejected with 401.
+  #
+  # The reality is safer than the comment claimed, which is the good direction to be
+  # wrong in -- but it was still wrong, and it was this comment that justified leaving
+  # the password alone. A security posture defended by a false statement about what the
+  # posture IS survives exactly until someone checks.
+  #
+  # Read it with:
+  #   kubectl get secret monitoring-grafana -n monitoring \
+  #     -o jsonpath='{.data.admin-password}' | base64 -d
+  #
+  # Still acceptable to leave generated: Grafana is a ClusterIP with no Ingress, so it
+  # is unreachable without an explicit kubectl port-forward. Nothing is committed.
   persistence:
     enabled: false
 

@@ -1,0 +1,114 @@
+# =============================================================================
+#  values-eks.yaml -- the EKS overlay for kube-prometheus-stack.
+#
+#      helm install monitoring prometheus-community/kube-prometheus-stack \
+#        -n monitoring --create-namespace --version 88.2.0 \
+#        -f monitoring/values.yaml -f monitoring/values-eks.yaml
+#
+#  AN OVERLAY, NOT A FORK. Helm merges -f files left to right, so this file
+#  contains ONLY the settings that genuinely differ on EKS. monitoring/values.yaml
+#  stays the single place the shared reasoning lives; duplicating it here would
+#  create two files about one subject, which is how they drift apart and one of
+#  them becomes wrong.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+#  🔴 THE CONTROL-PLANE SCRAPE JOBS -- AND A SESSION 4 ASSUMPTION THAT MEASURING
+#  PROVED WRONG.
+#
+#  monitoring/values.yaml disables four jobs, and says of them:
+#
+#      "On a real cluster (EKS, Session 5) these are reachable and would be
+#       left enabled."
+#
+#  THREE QUARTERS OF THAT IS FALSE, and the reason is the whole point of managed
+#  Kubernetes. Measured on this cluster at 34a:
+#
+#      kubectl get pods -n kube-system   ->  aws-node, coredns, kube-proxy,
+#                                            aws-load-balancer-controller
+#      pods matching etcd|scheduler|controller-manager, ALL namespaces  ->  0
+#
+#  On EKS the control plane is AWS's. kube-apiserver, kube-scheduler,
+#  kube-controller-manager and etcd run on instances inside an AWS-owned account
+#  that you have no network path to and cannot list. They are not hidden or
+#  firewalled -- they are NOT IN THIS CLUSTER. The chart's scrape configs for
+#  them target worker-node IPs on ports 10257 / 10259 / 2379, and a worker node
+#  runs none of those things.
+#
+#  ⚠️ So enabling them here would reproduce EXACTLY the failure minikube was
+#  disabled for: permanently red targets that can never turn green. The original
+#  reasoning ("four red lights that can never turn green just train you to
+#  ignore red") was right; only its prediction about EKS was wrong.
+#
+#  🔴 THE REAL LESSON, WHICH IS BIGGER THAN THIS CHART: with a managed control
+#  plane you do not observe the control plane -- AWS does, and you get an SLA
+#  instead of a dashboard. That is a genuine and often-unstated trade of a
+#  managed service. If an interviewer asks what you give up with EKS versus
+#  self-managed Kubernetes, this is a concrete, honest answer.
+# -----------------------------------------------------------------------------
+kubeControllerManager:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeEtcd:
+  enabled: false
+
+# -----------------------------------------------------------------------------
+#  kube-proxy IS the exception, and it is the only one of the four that changes.
+#
+#  It is not part of the managed control plane -- it runs as a DaemonSet on OUR
+#  worker nodes, one pod per node, and it is right there in `kubectl get pods`.
+#  So unlike the three above there is something real to scrape.
+#
+#  ⚠️ Enabled here as a TEST, not as a certainty. kube-proxy only exposes metrics
+#  if its config sets `metricsBindAddress` to something other than a loopback
+#  address, and that is EKS's choice rather than ours. 34b reads the target list:
+#  if this one is DOWN it gets switched off with the same reasoning as the three
+#  above, and the fact that it was tried is recorded rather than the setting
+#  being quietly reverted.
+# -----------------------------------------------------------------------------
+kubeProxy:
+  enabled: true
+
+# -----------------------------------------------------------------------------
+#  PROMETHEUS -- more memory than the laptop build, for one specific reason.
+#
+#  The minikube sizing (400Mi request / 700Mi limit) was fitted to a node that
+#  was already at 84% of a 4.5 GB Docker VM. These nodes have ~3292Mi allocatable
+#  each and are currently at 35% and 46%, so the constraint is gone.
+#
+#  🔴 The reason to spend it is Task 35, not comfort. Prometheus holds every
+#  active series in memory, and the load test is about to multiply the series
+#  count: 32a's histogram publishes 51 buckets per timer, there are 5 application
+#  pods, and the producer's HPA can add 2 more under load. An OOMKilled
+#  Prometheus midway through the load test would destroy the measurement AND the
+#  evidence of it -- and it would look like the application had failed.
+#
+#  Retention stays at 6h (inherited): the whole session fits inside it, and the
+#  storage is still an emptyDir, so a deleted pod still loses the history. That
+#  trade is unchanged and is stated in monitoring/values.yaml.
+# -----------------------------------------------------------------------------
+prometheus:
+  prometheusSpec:
+    resources:
+      requests:
+        cpu: 200m
+        memory: 900Mi
+      limits:
+        cpu: 1500m
+        memory: 1600Mi
+
+# -----------------------------------------------------------------------------
+#  Alertmanager stays OFF, and defaultRules stay OFF.
+#
+#  Inherited from monitoring/values.yaml and deliberately NOT reversed here even
+#  though the capacity now exists. The reason was never capacity -- it is that
+#  there is nowhere for an alert to go. No email, no pager, no Slack. Turning on
+#  100 rules that fire into a disabled Alertmanager would burn CPU to produce
+#  notifications for nobody.
+#
+#  ⚠️ The consequence is unchanged and worth restating rather than hiding: this
+#  stack is DASHBOARDS-ONLY. A dashboard shows you; an alert tells you. Nothing
+#  here will ever wake anyone up, and "I built observability" should not be said
+#  in a way that implies otherwise.
+# -----------------------------------------------------------------------------
