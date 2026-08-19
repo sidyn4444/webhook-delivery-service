@@ -149,6 +149,37 @@ purely so a scraper could find it would undo a considered design decision for a 
 convenience. Both scrape pod IPs, so three workers produce three independent time series rather
 than one blended average.
 
+## Observability
+
+![Delivery throughput, success/failure split, latency quantiles and queue backlog](assets/dashboard-overview.png)
+
+![Retries, dead-letter queue by reason, and pod health](assets/dashboard-detail.png)
+
+Six panels and four stat tiles, built from PromQL over Micrometer histograms. What the shapes
+above actually show, reading left to right:
+
+- **Delivery throughput** peaks around **200/sec** during the saturation runs, then flat-lines
+  when the load stops — the workers are idle, not stuck.
+- **Success vs failure** is almost entirely `SUCCESS`, with the deliberate `CLIENT_ERROR` (a `400`
+  subscriber, dead-lettered immediately) and `SERVER_ERROR` (a `503`, retried with backoff) runs
+  visible as the small coloured bands.
+- **Delivery latency** sits flat near zero for the whole load test and then spikes to **3 s** —
+  that spike is *not* a regression, it is the chaos test's deliberately slow subscriber, chosen so
+  that jobs would actually be in flight when a worker was killed.
+- 🔴 **Queue backlog is the most important panel.** It climbs to **~48,000** during the runs where
+  the producer was accepting faster than the workers could deliver, and returns to zero when it
+  isn't. **`POST /events` returns `202` on enqueue, so a saturated system looks perfectly healthy
+  from the front door — this line is the only place the truth shows up.**
+- **Dead-letter queue by reason** separates `NON_RETRIABLE_RESPONSE` from `RETRIES_EXHAUSTED`,
+  because those are two different problems fixed by two different people.
+- **Container restarts: 0** across the whole session, including the chaos test — the killed pod
+  was *replaced*, not restarted, which is a different thing and the counter correctly says so.
+
+⚠️ **Two aggregation rules are enforced in these queries and are easy to get backwards.** Delivery
+counts are summed across pods, because each worker measures its own traffic. The queue-depth
+gauges use `max()`, because they describe **shared Redis state that every pod reports identically**
+— summing them reported a 4-job dead-letter queue as **12**, wrong by exactly the replica count.
+
 ## Design decisions
 
 | Decision | Why |

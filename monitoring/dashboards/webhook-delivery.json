@@ -319,8 +319,8 @@
     {
       "id": 6,
       "type": "timeseries",
-      "title": "Dead-letter queue by reason",
-      "description": "Jobs permanently given up on. The only queue here that represents real loss -- every other depth drains on its own; nothing drains this one.\n\nSplit by reason because the three mean different things and different people fix them: UNPARSEABLE is a bug in OUR serialisation, NON_RETRIABLE_RESPONSE is the subscriber rejecting us outright, RETRIES_EXHAUSTED is a subscriber that was down too long.\n\nSafe as a label because DlqReason is a 3-constant enum -- bounded by our source code, not by anything a caller supplies.",
+      "title": "Dead-letter queue \u2014 by reason, and the durable total",
+      "description": "Jobs permanently given up on in the selected window, split by reason. The only queue here that represents real loss -- every other depth drains on its own; nothing drains this one.\n\n*** increase() AND NOT A RAW COUNTER SUM, AND THE FIRST VERSION OF THIS PANEL GOT IT WRONG. ***\n\nA Prometheus counter lives in the process that owns it. Kill a pod and its series DISAPPEARS; the replacement starts a new series at zero. So sum(counter) across pods is NOT monotonic when the pod set changes -- and this panel was drawing DESCENDING dead-letter lines after the chaos test killed workers, which is impossible for a quantity that only ever grows.\n\nMeasured: the raw sum read 5 while the dead-letter queue actually held 7. increase() is reset-aware and handles a vanished series correctly.\n\nSplit by reason because the three mean different things and different people fix them: UNPARSEABLE is a bug in OUR serialisation, NON_RETRIABLE_RESPONSE is the subscriber rejecting us outright, RETRIES_EXHAUSTED is a subscriber that was down too long. Safe as a label because DlqReason is a 3-constant enum -- bounded by our source, not by anything a caller supplies.\n\nFor the CURRENT depth use the 'DLQ depth now' tile: it reads Redis directly and is the durable truth.",
       "datasource": {
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
@@ -331,9 +331,20 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sum by (reason) (webhook_dlq_entries_total)",
-          "legendFormat": "{{reason}}",
+          "expr": "sum by (reason) (increase(webhook_dlq_entries_total[$__range]))",
+          "legendFormat": "{{reason}} (this window)",
           "refId": "A",
+          "editorMode": "code",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "max(webhook_dlq_depth)",
+          "legendFormat": "total in queue (durable)",
+          "refId": "B",
           "editorMode": "code",
           "range": true
         }
