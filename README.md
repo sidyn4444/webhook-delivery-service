@@ -50,8 +50,8 @@ The five Redis keys:
                  │                     Redis                         │
                  │  webhooks:queue      ready to deliver  (list)     │
                  │  webhooks:processing in flight         (list)     │
-                 │  webhooks:inflight   pickup times      (zset)     │
-                 │  webhooks:retry      scheduled by due-time (zset) │
+                 │  webhooks:inflight   pickup times (sorted set)    │
+                 │  webhooks:retry      due-time order (sorted set)  │
                  │  webhooks:dlq        gave up, with a reason (list)│
                  └──────┬────────────────────────────────────────────┘
                         │ RPOPLPUSH (atomic move, not delete)
@@ -108,8 +108,8 @@ a worker mid-delivery survivable.
 ```
 
 Redis and Postgres only accept connections from the cluster's own machines, and they sit on a
-private network with no route out to the internet. Outgoing webhooks leave through a NAT Gateway,
-so the subscriber sees that address instead of one of our servers.
+private network with no route out to the internet. Outgoing webhooks leave through a NAT Gateway —
+a single shared exit — so the subscriber sees that address instead of one of our servers.
 
 Workers don't get a Kubernetes Service, because nothing ever calls a worker. Prometheus scrapes
 each worker pod directly instead, so all three report their own numbers rather than getting
@@ -197,7 +197,8 @@ I tested these by actually breaking things instead of assuming they'd work.
   slow endpoint so deliveries were still in progress. I killed one while it was holding a job. The
   job survived, the other two kept delivering, and about a minute later one of them picked up the
   abandoned job and finished it — exactly once, even though both were checking every 10 seconds.
-  That's what the Lua script is for.
+  The reclaim is a Lua script, which Redis runs start to finish without letting anything else in,
+  so only one worker can win it.
 - **Killed a worker pod on EKS while it was under load.** Same result. A surviving worker logged
   that it re-queued the abandoned event, and that event ended up with exactly one row in the
   database — not zero, not two. Across the whole run, 10,800 events came in and 10,800 delivery
@@ -235,6 +236,6 @@ Route 53 · Micrometer · Prometheus · Grafana
 
 ## Not implemented
 
-Only the AWS load balancer controller uses IRSA; the app pods read their credentials from
-Kubernetes Secrets. There's no alerting either — the dashboards exist but nothing would page
-anyone.
+Only the AWS load balancer controller uses IRSA — the setup where a pod assumes an IAM role
+instead of holding AWS keys. The app pods just read their credentials from Kubernetes Secrets.
+There's no alerting either — the dashboards exist but nothing would page anyone.
