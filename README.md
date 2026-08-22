@@ -13,10 +13,8 @@ Java 21 / Spring Boot 3 service that delivers HTTP webhooks to third-party endpo
 queue with at-least-once delivery, exponential backoff with jitter, a dead-letter queue,
 HMAC-SHA256 request signing, and SSRF checks on every subscriber URL. Deployed on AWS EKS.
 
-Measured on EKS (2 × `t3.medium`, 2 producer pods, 3 worker pods): **178 deliveries/sec** with the
-queue backlog flat, **p50 2.5 ms · p95 4.8 ms · p99 5.3 ms**, and **zero events lost** when a
-worker pod is killed mid-delivery, with the pool back to 3/3 in 34 s. Method and the four
-independent capacity measurements are in [BENCHMARKS.md](BENCHMARKS.md).
+Load test and chaos test results, with the method behind them, are in
+[BENCHMARKS.md](BENCHMARKS.md).
 
 ## Components
 
@@ -69,9 +67,8 @@ acks. On a retryable failure it schedules the job in `retry` with a jittered due
 permanent one, or once retries run out, it goes to `dlq` with a reason. The sweep thread re-queues
 jobs held past the delivery timeout, which is what makes a worker dying mid-delivery survivable.
 
-Producer and worker are separate deployments and scale independently. The load test found the
-workers are the constraint: the producer accepted **576 events/sec** while three workers delivered
-**196/sec**, so the scaling lever is worker replicas.
+Producer and worker are separate deployments and scale independently. Delivery throughput scales
+with worker replicas.
 
 ### On AWS
 
@@ -151,59 +148,16 @@ A subscriber on `localhost` is refused with a `400`. `localhost` is `127.0.0.1` 
 cannot tell a test server from an attacker's internal target — they are the same address. Use a
 public endpoint. There is no dev-profile bypass, deliberately.
 
-## Observability
+## Monitoring
+
+Both services expose Micrometer metrics on `/actuator/prometheus`. The Helm values in
+`monitoring/` install kube-prometheus-stack and the dashboard JSON, which gives six panels and
+four stat tiles: delivery throughput, success/failure split, latency percentiles, queue backlog,
+dead-letter queue by reason, and pod health.
 
 ![Delivery throughput, success/failure split, latency percentiles and queue backlog](assets/dashboard-overview.png)
 
 ![Retries, dead-letter queue by reason, and pod health](assets/dashboard-detail.png)
-
-Six panels and four stat tiles, PromQL over Micrometer metrics. Queue backlog is the panel that
-matters: it climbs to ~48,000 when the producer accepts faster than the workers deliver, and
-returns to zero when it doesn't. `POST /events` returns `202` on enqueue, so a saturated system
-still looks healthy from the front door.
-
-Delivery counts are summed across pods, because each worker counts its own traffic. Queue-depth
-gauges use `max()`, because every pod reports the same shared Redis state — summing them reported
-a 4-job dead-letter queue as 12, wrong by exactly the replica count.
-
-## Design notes
-
-- **At-least-once, not exactly-once.** Every event carries a stable `event_id` so the receiver can
-  spot and drop duplicates. Same approach Stripe and GitHub use.
-- **`RPOPLPUSH` + explicit ack, not `BLPOP`.** `BLPOP` deletes the job the moment it hands it out,
-  so a worker dying mid-delivery loses an event that was already accepted.
-- **Retries wait in Redis, not in the worker.** `Thread.sleep` ties up one of a small number of
-  workers for up to 16s, and the delay only exists in memory, so a restart loses it. A sorted set
-  scored by due-time survives both.
-- **Signing happens at send time, not at enqueue.** A signature made at enqueue is minutes old by
-  the time a retry goes out and the receiver rejects it as stale. Both versions pass the happy
-  path, which is why it is easy to get wrong.
-- **URLs are judged by the resolved IP, not the hostname.** `localtest.me` is a real public domain
-  that resolves to `127.0.0.1`, so blocking strings only catches typos.
-- **The delivery log stores no payloads.** Payloads can contain personal data. The queue needs
-  them briefly; a permanent log does not.
-
-## Reliability
-
-Each of these was verified by causing the failure, not by reasoning about it.
-
-- **Worker `kill -9`'d mid-delivery, locally.** Three worker processes, nine events against a
-  deliberately slow endpoint so the work overlapped. One worker killed while holding a job; the
-  job and its pickup time survived, the other two kept delivering, and ~60s later a sibling
-  reclaimed and finished the orphan. `RECLAIMED` appears exactly once across all three logs even
-  though two workers swept the same job every 10 seconds — the Lua script guarantees that.
-- **Worker pod killed with `--grace-period=0` on EKS, under load.** `webhook_processing_depth`
-  read 3 at the instant of the kill. A surviving worker logged
-  `RECLAIMED event 08c7f640-… — no worker completed it within 60s, re-queued`, and that event has
-  exactly one row in PostgreSQL. Over the full run: **10,800 accepted → 10,800 delivery attempts →
-  0 dead-lettered**.
-- **SSRF check disabled on purpose.** Without it,
-  `http://169.254.169.254/latest/meta-data/` returned `202` and landed on the queue as a real job.
-  Restored, the same URL returns `400` and the queue length does not move.
-
-The 34 s recovery is Kubernetes replacing a missing pod — any Deployment does that. The zero-loss
-result is the queue: a job the dead worker had already taken off the queue is invisible to
-Kubernetes.
 
 ## Security
 
