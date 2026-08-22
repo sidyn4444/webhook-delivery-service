@@ -9,28 +9,34 @@
 ![AWS](https://img.shields.io/badge/AWS-ElastiCache%20%C2%B7%20RDS%20%C2%B7%20ALB-FF9900)
 ![Prometheus](https://img.shields.io/badge/Prometheus-Grafana-E6522C)
 
-Java 21 / Spring Boot 3 service that delivers HTTP webhooks to third-party endpoints. Redis-backed
-queue with at-least-once delivery, exponential backoff with jitter, a dead-letter queue,
-HMAC-SHA256 request signing, and SSRF checks on every subscriber URL. Deployed on AWS EKS.
+Sends webhooks — HTTP callbacks — to other people's servers and keeps trying until they go
+through. Java 21 and Spring Boot 3, running on AWS EKS.
 
-Load test and chaos test results, with the method behind them, are in
-[BENCHMARKS.md](BENCHMARKS.md).
+The hard part is that you don't control the server you're calling. It can be slow, down, or just
+broken, and you still can't lose the event. So events go into a Redis queue, workers pull them off
+and deliver them, and anything that fails gets retried on a schedule instead of being dropped.
+
+Load test and chaos test results are in [BENCHMARKS.md](BENCHMARKS.md).
 
 ## Components
 
-| Module | Responsibility |
+| Module | What it does |
 |---|---|
-| `producer` | Spring Boot web app. `POST /events` validates the payload, resolves and checks the subscriber URL, pushes to Redis, returns `202`. |
-| `worker` | Daemon, no web server. Three threads: poll loop, retry scheduler, recovery sweep. Signs and delivers, writes the attempt row, then acks. |
-| `common` | Job model shared by both. A schema change becomes a compile error instead of a runtime deserialization failure. |
-| `k8s/` | Deployments, Services, ConfigMap, Secrets, HPA, probes. `local/` and `eks/` variants. |
-| `deploy/cluster.yaml` | eksctl cluster definition — node groups, private subnets, addons. |
-| `monitoring/` | kube-prometheus-stack Helm values and the Grafana dashboard JSON. |
-| `scripts/` | In-cluster load generator and the chaos test. |
+| `producer` | The web app. `POST /events` checks the request, checks the URL is safe to call, puts the job in Redis, and returns `202`. |
+| `worker` | Background service, no web server. Three threads: one pulls jobs off the queue and delivers them, one handles retries, one picks up jobs from workers that died. |
+| `common` | The job format both sides share, so changing it breaks the build instead of breaking later at runtime. |
+| `k8s/` | Kubernetes config — deployments, services, secrets, health checks. Separate versions for local and EKS. |
+| `deploy/cluster.yaml` | The EKS cluster definition, used by `eksctl`. |
+| `monitoring/` | Prometheus and Grafana setup, plus the dashboard. |
+| `scripts/` | The load test and the chaos test. |
 
-Redis keys: `webhooks:queue` (ready), `webhooks:processing` (in flight), `webhooks:inflight`
-(pickup times, zset), `webhooks:retry` (scheduled by due-time, zset), `webhooks:dlq` (gave up,
-with a reason).
+The five Redis keys:
+
+- `webhooks:queue` — waiting to be delivered
+- `webhooks:processing` — being delivered right now
+- `webhooks:inflight` — when each job was picked up
+- `webhooks:retry` — scheduled to try again later
+- `webhooks:dlq` — gave up, with a reason attached
 
 ## Architecture
 
@@ -61,14 +67,16 @@ with a reason).
               └──────────────┘
 ```
 
-A worker moves a job from `queue` to `processing` rather than deleting it, so the job is never in
-zero places, and records when it picked it up. On a 2xx it writes the attempt row first, then
-acks. On a retryable failure it schedules the job in `retry` with a jittered due-time; on a
-permanent one, or once retries run out, it goes to `dlq` with a reason. The sweep thread re-queues
-jobs held past the delivery timeout, which is what makes a worker dying mid-delivery survivable.
+A worker **moves** a job from `queue` to `processing` instead of deleting it, so the job is never
+in nowhere, and writes down when it picked it up.
 
-Producer and worker are separate deployments and scale independently. Delivery throughput scales
-with worker replicas.
+If the delivery works, it saves the log row first and then drops the job. If it fails but is worth
+retrying, the job goes into `retry` with a time to try again. If it fails for good, or runs out of
+retries, it goes to `dlq`.
+
+The third thread looks for jobs that have been sitting in `processing` for too long. That means
+the worker holding it died, so it puts them back on the queue. That's the part that makes losing
+a worker mid-delivery survivable.
 
 ### On AWS
 
@@ -99,31 +107,32 @@ with worker replicas.
                                         worker → subscriber ─┘
 ```
 
-Datastores accept traffic only from the node security group and sit in subnets with no route to
-the internet. Outbound delivery leaves through a NAT Gateway, so a subscriber sees the NAT address
-and never a node's.
+Redis and Postgres only accept connections from the cluster's own machines, and they sit on a
+private network with no route out to the internet. Outgoing webhooks leave through a NAT Gateway,
+so the subscriber sees that address instead of one of our servers.
 
-Workers have no Service, because nothing calls a worker. Prometheus finds producers with a
-`ServiceMonitor` and workers with a `PodMonitor`, both scraping pod IPs, so three workers produce
-three separate time series instead of one blended average.
+Workers don't get a Kubernetes Service, because nothing ever calls a worker. Prometheus scrapes
+each worker pod directly instead, so all three report their own numbers rather than getting
+averaged into one.
 
 ## Design notes
 
-- **At-least-once, not exactly-once.** Every event carries a stable `event_id` so the receiver can
-  spot and drop duplicates. Same approach Stripe and GitHub use.
-- **`RPOPLPUSH` + explicit ack, not `BLPOP`.** `BLPOP` deletes the job the moment it hands it out,
-  so a worker dying mid-delivery loses an event that was already accepted. `RPOPLPUSH` moves it,
-  so the job is never in zero places.
-- **Retries wait in Redis, not in the worker.** `Thread.sleep` ties up one of a small number of
-  workers for up to 16s, and the delay only exists in memory, so a restart loses it. A sorted set
-  scored by due-time survives both.
-- **Signing happens at send time, not at enqueue.** A signature made at enqueue is minutes old by
-  the time a retry goes out, and the receiver rejects it as stale. Both versions pass the happy
-  path, which is why it is easy to get wrong.
-- **URLs are judged by the resolved IP, not the hostname.** `localtest.me` is a real public domain
-  that resolves to `127.0.0.1`, so blocking strings only catches typos.
-- **The delivery log stores no payloads.** Payloads can contain personal data. The queue needs them
-  briefly; a permanent log does not.
+- **At-least-once, not exactly-once.** Exactly-once isn't really possible over a network that can
+  drop things. Every event has an id that stays the same across retries, so the receiver can spot
+  a duplicate and ignore it. Stripe and GitHub do the same thing.
+- **`RPOPLPUSH` instead of `BLPOP`.** `BLPOP` deletes the job the moment it hands it out, so if
+  that worker dies you've lost an event you already told the caller you'd accepted. `RPOPLPUSH`
+  moves it instead, so it's always somewhere.
+- **Retries wait in Redis, not in the worker.** Sleeping inside the worker ties it up for up to 16
+  seconds doing nothing, and if it restarts the retry is gone. Storing it in Redis with a time
+  attached survives both.
+- **Signing happens right before sending, not when the job is queued.** A signature made at queue
+  time is minutes old by the time a retry actually goes out, and the receiver rejects it for being
+  too old. Both versions work on the first try, which is what makes it easy to get wrong.
+- **URLs get checked by the IP they resolve to, not the text.** `localtest.me` is a real domain
+  that points at `127.0.0.1`, so blocking suspicious-looking strings only catches honest typos.
+- **The delivery log doesn't store payloads.** They can contain personal data. The queue needs them
+  for a few seconds; a permanent log doesn't need them at all.
 
 ## Setup
 
@@ -143,8 +152,8 @@ curl localhost:8080/actuator/health
 # {"status":"UP","groups":["liveness","readiness"]}
 ```
 
-`/actuator/health/liveness` and `/actuator/health/readiness` are the endpoints the Kubernetes
-probes call to decide whether to restart a pod or stop sending it traffic.
+Those two groups are what Kubernetes checks to decide whether to restart a pod or stop sending it
+traffic.
 
 ### Sending an event
 
@@ -159,49 +168,73 @@ curl -X POST localhost:8080/events \
 # HTTP 202 — accepted, not yet delivered
 ```
 
-`202` means queued, not delivered. A `200` would claim it reached the subscriber, and a caller who
-believes that never retries.
+`202` means queued, not delivered. A `200` would be claiming it already reached the subscriber,
+and a caller who believes that will never retry.
 
-A subscriber on `localhost` is refused with a `400`. `localhost` is `127.0.0.1` and the SSRF check
-cannot tell a test server from an attacker's internal target — they are the same address. Use a
-public endpoint. There is no dev-profile bypass, deliberately.
+A subscriber on `localhost` gets refused with a `400`. `localhost` is `127.0.0.1`, and the URL
+check can't tell a harmless test server from an attacker pointing us at something internal — they
+look the same from the address. Use a public endpoint to try it out.
 
 ## Monitoring
 
-Both services expose Micrometer metrics on `/actuator/prometheus`. The Helm values in
-`monitoring/` install kube-prometheus-stack and the dashboard JSON, which gives six panels and
-four stat tiles: delivery throughput, success/failure split, latency percentiles, queue backlog,
-dead-letter queue by reason, and pod health.
+Both services expose metrics that Prometheus scrapes, and the dashboard in `monitoring/` shows
+delivery rate, successes vs failures, how long deliveries take, how big the queue is, what's in
+the dead-letter queue, and pod health.
 
-![Delivery throughput, success/failure split, latency percentiles and queue backlog](assets/dashboard-overview.png)
+![Delivery rate, successes vs failures, delivery times and queue size](assets/dashboard-overview.png)
 
 ![Retries, dead-letter queue by reason, and pod health](assets/dashboard-detail.png)
 
+The queue size panel is the one that matters most. `POST /events` returns `202` as soon as the job
+is queued, so if the workers fall behind the service still looks completely healthy from the
+outside — the queue is the only place you'd notice.
+
+## Reliability
+
+I tested these by actually breaking things instead of assuming they'd work.
+
+- **Killed a worker mid-delivery, locally.** Three workers, nine events going to a deliberately
+  slow endpoint so deliveries were still in progress. I killed one while it was holding a job. The
+  job survived, the other two kept delivering, and about a minute later one of them picked up the
+  abandoned job and finished it — exactly once, even though both were checking every 10 seconds.
+  That's what the Lua script is for.
+- **Killed a worker pod on EKS while it was under load.** Same result. A surviving worker logged
+  that it re-queued the abandoned event, and that event ended up with exactly one row in the
+  database — not zero, not two. Across the whole run, 10,800 events came in and 10,800 delivery
+  attempts went out, with none dead-lettered.
+- **Turned the URL check off on purpose** to make sure it was really the thing doing the blocking.
+  With it off, a URL pointing at the AWS internal metadata address was accepted and queued as a
+  real job. With it back on, the same URL gets a `400` and nothing is added to the queue.
+
+Worth being clear about one thing: the pool coming back in 34 seconds is just Kubernetes replacing
+a pod, which it does for any deployment. The part my code is responsible for is that no event was
+lost, because Kubernetes has no idea a job was in progress.
+
 ## Security
 
-- **HMAC-SHA256 signing** on every outbound webhook (`X-Webhook-Signature: t=…,v1=…`), computed
-  over `timestamp.payload` so a captured request cannot be replayed indefinitely.
-- **SSRF checks** — DNS resolved first, every resulting IP checked against loopback, private,
-  link-local (including the `169.254.169.254` metadata address) and internal IPv6 ranges.
-- **Hard 10s timeout** on every outbound call, covering DNS, connect, TLS and response.
-- **No secrets in git** — `.env` is gitignored, `.env.example` ships dummy values, and config reads
-  `${ENV_VAR}` with no defaults, so a missing secret fails startup instead of running
-  unauthenticated.
+- **Every webhook is signed** with HMAC-SHA256 over the timestamp and the body together, so the
+  receiver can check it came from us and that it isn't an old request being replayed.
+- **Every URL is resolved first, then checked.** The IP it points at can't be loopback, private,
+  link-local (which includes the AWS metadata address), or an internal IPv6 range.
+- **Every outgoing call has a hard 10 second timeout**, covering DNS, connecting, TLS and the
+  response.
+- **No secrets in the repo.** `.env` is gitignored, `.env.example` has fake values, and the config
+  has no fallback defaults, so a missing secret crashes the app at startup instead of quietly
+  running without auth.
 
-Not covered: DNS rebinding (the URL is checked at ingest and re-resolved at delivery, only the
-first is guarded), producer-side deduplication, and rate limiting.
+Not handled: DNS rebinding (the URL is checked when it arrives and looked up again at delivery, and
+only the first one is guarded), duplicate detection on our side, and rate limiting.
 
 ## Stack
 
-Java 21 · Spring Boot 3.3 · Maven (multi-module) · Spring WebClient · Spring Data Redis (Lettuce) ·
-Redis 7 with sorted sets and Lua · Spring Data JPA / Hibernate · PostgreSQL 16 · Flyway · JUnit 5 ·
-Mockito · JaCoCo · Docker Compose
+Java 21 · Spring Boot 3.3 · Maven · Spring WebClient · Redis 7 (Lettuce, sorted sets, Lua) ·
+JPA / Hibernate · PostgreSQL 16 · Flyway · JUnit 5 · Mockito · JaCoCo · Docker Compose
 
-Docker (multi-stage, distroless, non-root) · Kubernetes 1.34 · Helm · AWS EKS · ElastiCache Redis ·
-RDS PostgreSQL · ECR · ALB Ingress Controller · ACM · Route 53 · IRSA · Micrometer · Prometheus ·
-Grafana
+Docker · Kubernetes 1.34 · Helm · AWS EKS · ElastiCache Redis · RDS PostgreSQL · ECR · ALB · ACM ·
+Route 53 · Micrometer · Prometheus · Grafana
 
 ## Not implemented
 
-Only the AWS Load Balancer Controller uses IRSA; the application pods read Kubernetes Secrets.
-No alerting — Alertmanager is off, so the stack is dashboards only.
+Only the AWS load balancer controller uses IRSA; the app pods read their credentials from
+Kubernetes Secrets. There's no alerting either — the dashboards exist but nothing would page
+anyone.
