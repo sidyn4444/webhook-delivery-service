@@ -107,6 +107,24 @@ Workers have no Service, because nothing calls a worker. Prometheus finds produc
 `ServiceMonitor` and workers with a `PodMonitor`, both scraping pod IPs, so three workers produce
 three separate time series instead of one blended average.
 
+## Design notes
+
+- **At-least-once, not exactly-once.** Every event carries a stable `event_id` so the receiver can
+  spot and drop duplicates. Same approach Stripe and GitHub use.
+- **`RPOPLPUSH` + explicit ack, not `BLPOP`.** `BLPOP` deletes the job the moment it hands it out,
+  so a worker dying mid-delivery loses an event that was already accepted. `RPOPLPUSH` moves it,
+  so the job is never in zero places.
+- **Retries wait in Redis, not in the worker.** `Thread.sleep` ties up one of a small number of
+  workers for up to 16s, and the delay only exists in memory, so a restart loses it. A sorted set
+  scored by due-time survives both.
+- **Signing happens at send time, not at enqueue.** A signature made at enqueue is minutes old by
+  the time a retry goes out, and the receiver rejects it as stale. Both versions pass the happy
+  path, which is why it is easy to get wrong.
+- **URLs are judged by the resolved IP, not the hostname.** `localtest.me` is a real public domain
+  that resolves to `127.0.0.1`, so blocking strings only catches typos.
+- **The delivery log stores no payloads.** Payloads can contain personal data. The queue needs them
+  briefly; a permanent log does not.
+
 ## Setup
 
 Java 21, Maven 3.9+, Docker.
