@@ -234,8 +234,17 @@ JPA / Hibernate · PostgreSQL 16 · Flyway · JUnit 5 · Mockito · JaCoCo · Do
 Docker · Kubernetes 1.34 · Helm · AWS EKS · ElastiCache Redis · RDS PostgreSQL · ECR · ALB · ACM ·
 Route 53 · Micrometer · Prometheus · Grafana
 
-## Not implemented
+## What I'd add in v2
 
-Only the AWS load balancer controller uses IRSA — the setup where a pod assumes an IAM role
-instead of holding AWS keys. The app pods just read their credentials from Kubernetes Secrets.
-There's no alerting either — the dashboards exist but nothing would page anyone.
+- **Stop taking jobs when Postgres is down.** Right now the worker delivers the webhook, fails to
+  write the log row, and correctly doesn't ack — so the job goes back on the queue and gets
+  delivered again. For as long as the outage lasts the subscriber keeps getting the same webhook.
+  The fix is to pause the poll loop while the database is unreachable and pick it back up when it
+  recovers.
+- **Move the credentials to AWS Secrets Manager.** Only the AWS load balancer controller uses IRSA
+  right now — the app pods read their credentials from Kubernetes Secrets, which is base64 in
+  etcd, not encryption. Secrets Manager would get encryption at rest, rotation without a redeploy,
+  and a record of every read. The IRSA setup already exists for the load balancer controller, so
+  this would be a second use of something already working rather than new ground.
+- **Alerting.** The dashboards exist but nothing would page anyone. Alertmanager rules on the
+  counters already being exported would cover it.
