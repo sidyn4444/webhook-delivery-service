@@ -15,10 +15,6 @@ Sustained means the queue wasn't growing. Over 120 seconds the producer took 178
 the workers delivered 178.2/sec, and the queue absorbed an early burst of 50 and dropped back down
 to 12.
 
-That distinction matters because `POST /events` returns `202` as soon as the job is queued — it
-doesn't promise anything about delivery. A throughput number without a flat queue is really just
-measuring the load generator.
-
 ## The ramp
 
 | target | accepted | delivered | queue | p95 | |
@@ -27,6 +23,9 @@ measuring the load generator.
 | 180/s | 178.4/s | 178.2/s | 50 → 12 | 4.8 ms | **the number I'm reporting** |
 | unlimited, 3 threads | 576/s | 195.9/s | 0 → 46,510 | 4.8 ms | saturated |
 | unlimited, 50 threads | 557/s | 203.2/s | 0 → 23,426 | 5.0 ms | saturated |
+
+The producer takes events a lot faster than the workers deliver them, so the workers are the
+limit. More workers is the way to scale it, not more producers.
 
 ## Worker capacity
 
@@ -42,14 +41,6 @@ backlog with nothing new coming in:
 
 So capacity is around **195/sec**, and the 178/sec I report is about 91% of that.
 
-## The bottleneck is the workers, not the producer
-
-The producer took **576 events/sec** while the workers delivered **196/sec**. That's the most
-useful thing the load test found. At 576/sec the producer returned success for every single
-request while the queue grew to 46,510 — from the outside the service looked completely healthy.
-
-So the way to scale this is more workers, not more producers. Three workers do about 65/sec each.
-
 ## How I tested it
 
 - The load generator runs **inside the cluster** and posts to the producer's ClusterIP. I tried
@@ -59,23 +50,17 @@ So the way to scale this is more workers, not more producers. Three workers do a
   measuring the generator.
 - **I measured the generator's own ceiling first**, against an endpoint that does nothing. If I'd
   measured it against `/events` I'd have gotten the same number twice under two different names.
+- **The subscriber is an nginx in the same cluster**, reached through its own load balancer, not a
+  real third-party endpoint. An earlier run against `httpbin.org` gave a p95 of **373 ms**, and
+  almost all of that was someone else's server.
 - **Every event id is unique.** The producer rejects repeats, so a tool replaying the same body
   would have been measuring the rejection path.
 - **Latency is the workers' outbound POST** — an actual delivery — pulled from histogram buckets
   so it adds up correctly across all three worker pods.
-
-## What would make these numbers wrong
-
-- **The subscriber is an nginx in the same cluster**, reached through its own load balancer. It
-  isn't a real third-party endpoint. An earlier run against `httpbin.org` gave a p95 of **373 ms**,
-  and almost all of that was someone else's server.
-- The delivery still crosses a real network hop, so 4.8 ms isn't a loopback number — but a real
-  subscriber out on the internet would be slower.
-- **The generator skips the load balancer and TLS**, so these numbers don't cover the public HTTPS
-  path. That's tested separately.
-- **No autoscaling.** Fixed at 2 producers and 3 workers. The HPA never fired.
-- **`t3.medium` is burstable.** These runs were minutes long and didn't run out of CPU credits. A
-  multi-hour run might.
+- **Delivery counts come from the Postgres log, not Prometheus.** A counter lives inside the
+  process that owns it, so killing a pod makes that series disappear and the replacement starts
+  over at zero. My first attempt summed the counter across pods and reported minus 68,058.
+- Fixed at 2 producers and 3 workers throughout. No autoscaling — the HPA never fired.
 
 # Chaos test
 
@@ -90,16 +75,12 @@ no clean shutdown and jobs still in flight.
 
 The 34 seconds is Kubernetes replacing a missing pod, which it does for any deployment. The
 zero-loss part is the queue — a job the dead worker had already taken off the queue is invisible
-to Kubernetes, and replacing a pod does nothing to put it back.
+to Kubernetes.
 
-## Proving the reclaim actually happened
-
-The first run killed a worker during 5 ms deliveries and didn't catch anything in flight. That
-still showed nothing was lost, but it never exercised the recovery path. So I ran it again with a
-deliberately slow subscriber (3 seconds per delivery) so jobs were definitely being held —
-`webhook_processing_depth` read 3 at the moment of the kill.
-
-A worker that survived then logged this:
+The first run killed a worker during 5 ms deliveries and didn't catch anything in flight, so it
+never exercised the recovery path. I ran it again with a deliberately slow subscriber (3 seconds
+per delivery) so jobs were definitely being held — `webhook_processing_depth` read 3 at the moment
+of the kill. A worker that survived then logged this:
 
 ```
 RECLAIMED event 08c7f640-… — no worker completed it within 60s, re-queued for attempt 1 of 5
@@ -117,23 +98,3 @@ One row. The killed worker took the job and died before writing anything, the sw
 and another worker delivered it once. No loss and no duplicate.
 
 Across the whole window: 21,612 rows, 21,612 distinct events, 0 failed.
-
-## The counting mistake I made
-
-My first attempt counted deliveries with `sum(http_client_requests_seconds_count)` and got
-**minus 68,058**.
-
-A Prometheus counter lives inside the process that owns it. Kill the pod and that series
-disappears, and the replacement starts over at zero — so summing across pods breaks as soon as the
-set of pods changes, which is exactly what a chaos test does.
-
-The count comes from the Postgres delivery log instead. A row per attempt outlives the pod that
-wrote it.
-
-## What I didn't test
-
-- Only one pod, and only a worker. No producer, node, Redis or RDS failure.
-- The 60 second reclaim is a setting, not a discovered limit. Lower it and recovery is faster, but
-  you risk grabbing a job that was just slow.
-- Duplicates are allowed by design — the subscriber is meant to dedupe on `X-Webhook-Event-Id`.
-  This run just happened not to produce one.
