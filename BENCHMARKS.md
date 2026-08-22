@@ -50,9 +50,9 @@ So capacity is around **195/sec**, and the 178/sec I report is about 91% of that
   measuring the generator.
 - **I measured the generator's own ceiling first**, against an endpoint that does nothing. If I'd
   measured it against `/events` I'd have gotten the same number twice under two different names.
-- **The subscriber is an nginx in the same cluster**, reached through its own load balancer, not a
-  real third-party endpoint. An earlier run against `httpbin.org` gave a p95 of **373 ms**, and
-  almost all of that was someone else's server.
+- **The subscriber is a basic web server I ran in the same cluster**, reached through its own load
+  balancer, not a real third-party endpoint. An earlier run against `httpbin.org` gave a p95 of
+  **373 ms**, and almost all of that was someone else's server.
 - **Every event id is unique.** The producer rejects repeats, so a tool replaying the same body
   would have been measuring the rejection path.
 - **Latency is the workers' outbound POST** — an actual delivery — pulled from histogram buckets
