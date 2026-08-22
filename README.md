@@ -224,7 +224,7 @@ I repeated the failure tests on the real cluster with the load generator running
   `${ENV_VAR}` placeholders with **no defaults**, so a missing secret fails startup rather than
   silently running unauthenticated.
 
-**Known gaps** — I'd rather name these than have someone find them:
+**Known gaps:**
 
 - **DNS rebinding is undefended.** The URL is checked at ingest and re-resolved by the worker at
   delivery time; only the first moment is guarded. Pinning the validated IP is the fix.
@@ -284,38 +284,7 @@ PostgreSQL 16 · Flyway · JUnit 5 · Mockito · JaCoCo · Docker Compose
 AWS EKS · ElastiCache Redis · RDS PostgreSQL · ECR · ALB Ingress Controller · ACM · Route 53 ·
 IRSA · Micrometer · Prometheus · Grafana
 
-**Deliberately not used** — Terraform (the cluster is defined in `deploy/cluster.yaml` and
-created with `eksctl`; infrastructure-as-code was out of scope) · service mesh · CI/CD to the
-cluster · AWS Secrets Manager (Kubernetes Secrets are used instead — see *Honest limitations*)
+## What's not done
 
-## Honest limitations
-
-Stuff I know is wrong with it, so you don't have to go looking:
-
-- **The application pods do not use IRSA.** Only the AWS Load Balancer Controller does. The app
-  reads its credentials from Kubernetes Secrets. AWS Secrets Manager was scoped out.
-- **There is no alerting.** I never set up Alertmanager, so this is dashboards only. Nothing here
-  would page anyone.
-- **Delivery latency cannot be broken down per subscriber.** The `uri` and `client.name` labels
-  are collapsed to a constant, because subscriber URLs are unbounded and each unique pair cost a
-  measured 54 Prometheus series per pod. Per-subscriber timing lives in the PostgreSQL log
-  instead, where an extra row costs a lot less than an extra time series.
-- **The control plane is not observable.** On EKS, `etcd`, the scheduler and the controller
-  manager run in AWS's account — you get an SLA instead of a dashboard.
-- **No infrastructure-as-code.** The cluster is reproducible from `deploy/cluster.yaml`, but the
-  ALB, its target groups and its security groups are created by a controller and exist in no file.
-- **The load test's subscriber is an nginx behind an ALB**, not a third-party endpoint. Measuring
-  against `httpbin.org` gave a p95 of 373 ms, almost all of it someone else's server.
-
-## What I'd do differently
-
-- **Let the load balancer controller find its own VPC instead of hardcoding it.** That line broke
-  the first time I rebuilt the cluster — and the two values my checklist actually warned me about
-  regenerated identically.
-- **Write a script that checks every AWS id I've recorded still matches what's live.** A stale
-  value that happens to still be right looks exactly like a verified one.
-- **Pin the IP after validating it**, so the worker connects to the address that was actually
-  checked. Right now the URL is checked at ingest and re-resolved at delivery, which is what
-  leaves DNS rebinding open.
-- **Deduplicate on the producer side** with a `SETNX` on the event id, instead of putting the
-  whole burden on whoever receives the webhook.
+- Only the load balancer controller uses IRSA. The app pods just read Kubernetes Secrets.
+- No alerting. There are dashboards but nothing would page anyone — I never set up Alertmanager.
