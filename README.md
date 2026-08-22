@@ -11,9 +11,9 @@
 ![AWS](https://img.shields.io/badge/AWS-ElastiCache%20%C2%B7%20RDS%20%C2%B7%20ALB-FF9900)
 ![Prometheus](https://img.shields.io/badge/Prometheus-Grafana-E6522C)
 
-> A self-directed project built to work through distributed-systems fundamentals — delivery
-> semantics, reliable queueing, failure classification, and idempotency — as production code
-> rather than as reading. **Deployed and measured on AWS EKS.**
+> I built this to learn distributed systems properly — delivery guarantees, queueing, retries,
+> idempotency — by making the mistakes in code instead of just reading about them. It runs on
+> AWS EKS, and the numbers below were measured there.
 
 **Measured on EKS** — 2 × `t3.medium`, 2 producer pods, 3 worker pods:
 
@@ -23,8 +23,8 @@
 | **Delivery latency** | **p50 2.5 ms · p95 4.8 ms · p99 5.3 ms** |
 | **Worker-failure recovery** | **34 s to full pool, zero events lost** |
 
-"Sustained" means the queue backlog did not grow. Full method, the four independent capacity
-measurements, and every boundary that would invalidate a number: **[BENCHMARKS.md](BENCHMARKS.md)**.
+"Sustained" means the queue backlog didn't grow. How I measured all of this, and what would make
+each number wrong, is in **[BENCHMARKS.md](BENCHMARKS.md)**.
 
 ---
 
@@ -39,8 +39,8 @@ making an HTTP request to a server **you do not control**. It can be slow, down,
 or quietly broken — and delivery has to survive all of it without losing events and without
 hammering a struggling server.
 
-That's the problem this service solves, and it's the same one Stripe, GitHub, Twilio and Slack
-each solve internally.
+That's what this service handles. It's the same problem Stripe, GitHub, Twilio and Slack all
+have to deal with.
 
 ## What works today
 
@@ -48,7 +48,6 @@ each solve internally.
 |---|---|
 | `POST /events` → validated → queued → `202 Accepted` | ✅ |
 | Reliable queue — atomic hand-off, acknowledge only on a confirmed 2xx | ✅ |
-| Failure classification → retry vs. dead-letter | ✅ |
 | Exponential backoff **with jitter**, scheduled in a Redis sorted set | ✅ |
 | Dead-letter queue with a typed reason per entry | ✅ |
 | Multiple workers sharing one queue + recovery sweep for crashed workers | ✅ |
@@ -56,13 +55,8 @@ each solve internally.
 | SSRF validation — every URL judged by the **IP it resolves to** | ✅ |
 | Durable delivery-attempt log in PostgreSQL (metadata only, never payloads) | ✅ |
 | JUnit 5 + Mockito suite — **219 tests** across three modules | ✅ |
-| Multi-stage **distroless** images, non-root, built for `linux/amd64` | ✅ |
-| Kubernetes manifests — Deployments, Services, ConfigMap, Secrets, HPA | ✅ |
-| **AWS EKS** — nodes in private subnets, ElastiCache + RDS, images from ECR | ✅ |
-| **HTTPS at an ALB** with an ACM certificate, HTTP→HTTPS redirect | ✅ |
-| **IRSA** — the load balancer controller assumes an IAM role, no static keys | ✅ |
-| **Prometheus + Grafana** — delivery throughput, latency quantiles, DLQ depth, pod health | ✅ |
-| Load test and documented chaos test with measured numbers | ✅ |
+| **AWS EKS** — private subnets, ElastiCache + RDS, HTTPS at an ALB via ACM | ✅ |
+| **Prometheus + Grafana** — throughput, latency quantiles, DLQ depth, pod health | ✅ |
 
 ## Architecture
 
@@ -104,7 +98,7 @@ re-queues them, which is what makes a worker dying mid-delivery survivable.
 inbound traffic, the workers with delivery backlog. Redis is the only thing they share, which is
 what stops a slow subscriber from ever slowing down event ingestion.
 
-⚠️ **And the load test showed which one is actually the constraint:** the producer accepted
+**The load test showed which one is actually the constraint:** the producer accepted
 **576 events/sec** while three workers delivered **196/sec**. The bottleneck is the worker pool,
 so the scaling lever is worker replicas — an autoscaler on the *producer* would not have helped.
 
@@ -137,17 +131,16 @@ so the scaling lever is worker replicas — an autoscaler on the *producer* woul
                                         worker → subscriber ─┘
 ```
 
-🔴 **"Private subnet" is a stronger claim than "security group", and both are used.** A security
-group is a rule that can be written wrongly; a missing route is not a rule. The datastores accept
-traffic **only from the node security group** — verified as a group reference, not a CIDR — *and*
-sit in subnets with no route to the internet. Outbound delivery leaves through a NAT Gateway, so
-a subscriber sees the NAT's address and never a node's.
+**Both a security group and private subnets are used, and the subnets are the stronger one.** A
+security group is a rule you can write wrong; a subnet with no route out isn't a rule at all. The
+datastores only accept traffic from the node security group, and they sit in subnets with no route
+to the internet. Outbound delivery goes through a NAT Gateway, so a subscriber sees the NAT's
+address, never a node's.
 
-**The worker has no Service, deliberately** — nothing calls a worker. That is why Prometheus
-discovers producers with a `ServiceMonitor` and workers with a `PodMonitor`: inventing a Service
-purely so a scraper could find it would undo a considered design decision for a scraper's
-convenience. Both scrape pod IPs, so three workers produce three independent time series rather
-than one blended average.
+**The worker has no Service**, because nothing calls a worker. So Prometheus finds producers with
+a `ServiceMonitor` and workers with a `PodMonitor` — adding a Service just so the scraper could
+find them seemed like the wrong way round. Both scrape pod IPs, so three workers give three
+separate time series instead of one blended average.
 
 ## Observability
 
@@ -155,30 +148,23 @@ than one blended average.
 
 ![Retries, dead-letter queue by reason, and pod health](assets/dashboard-detail.png)
 
-Six panels and four stat tiles, built from PromQL over Micrometer histograms. What the shapes
-above actually show, reading left to right:
+Six panels and four stat tiles, built from PromQL over Micrometer histograms. The three that
+matter most:
 
 - **Delivery throughput** peaks around **200/sec** during the saturation runs, then flat-lines
   when the load stops — the workers are idle, not stuck.
-- **Success vs failure** is almost entirely `SUCCESS`, with the deliberate `CLIENT_ERROR` (a `400`
-  subscriber, dead-lettered immediately) and `SERVER_ERROR` (a `503`, retried with backoff) runs
-  visible as the small coloured bands.
-- **Delivery latency** sits flat near zero for the whole load test and then spikes to **3 s** —
-  that spike is *not* a regression, it is the chaos test's deliberately slow subscriber, chosen so
-  that jobs would actually be in flight when a worker was killed.
-- 🔴 **Queue backlog is the most important panel.** It climbs to **~48,000** during the runs where
-  the producer was accepting faster than the workers could deliver, and returns to zero when it
-  isn't. **`POST /events` returns `202` on enqueue, so a saturated system looks perfectly healthy
-  from the front door — this line is the only place the truth shows up.**
-- **Dead-letter queue by reason** separates `NON_RETRIABLE_RESPONSE` from `RETRIES_EXHAUSTED`,
-  because those are two different problems fixed by two different people.
-- **Container restarts: 0** across the whole session, including the chaos test — the killed pod
-  was *replaced*, not restarted, which is a different thing and the counter correctly says so.
+- **Delivery latency** sits flat near zero for the load test and then spikes to **3 s**. That
+  spike isn't a regression, it's the chaos test's deliberately slow subscriber, picked so jobs
+  would actually be in flight when I killed a worker.
+- **Queue backlog is the most important panel.** It climbs to **~48,000** when the producer is
+  accepting faster than the workers can deliver, and returns to zero when it isn't. `POST /events`
+  returns `202` on enqueue, so a saturated system looks perfectly healthy from the front door —
+  this line is the only place the truth shows up.
 
-⚠️ **Two aggregation rules are enforced in these queries and are easy to get backwards.** Delivery
-counts are summed across pods, because each worker measures its own traffic. The queue-depth
-gauges use `max()`, because they describe **shared Redis state that every pod reports identically**
-— summing them reported a 4-job dead-letter queue as **12**, wrong by exactly the replica count.
+One thing that's easy to get backwards: delivery counts get summed across pods, because each
+worker measures its own traffic, but the queue-depth gauges use `max()`, because every pod reports
+the same shared Redis state. Summing them showed a 4-job dead-letter queue as **12**, wrong by
+exactly the replica count. That one took me a while to spot.
 
 ## Design decisions
 
@@ -190,51 +176,41 @@ gauges use `max()`, because they describe **shared Redis state that every pod re
 | **Backoff is jittered** | 1s → 2s → 4s → 8s → 16s, randomized. Without jitter, a thousand deliveries that failed together retry together and take down a server that was recovering. |
 | **Sign at send time, never at enqueue** | A signature made at enqueue is minutes old by the time a retried delivery goes out, so the receiver rejects it as stale — and the happy path passes under both designs, which is what makes it easy to get wrong. |
 | **Judge the resolved IP, never the hostname** | The attacker registers the hostname. `localtest.me` is a real public domain that resolves to `127.0.0.1`, so a string blocklist catches only honest typos. |
-| **Three Maven modules, not two** | The producer serializes a job into Redis and the worker deserializes it — a wire contract between two processes. A shared module makes a schema change a compile error instead of a runtime deserialization failure. |
 | **The delivery log stores no payloads** | Payloads may contain PII. The queue needs them transiently; a permanent, queryable, backed-up audit log does not. A column that doesn't exist cannot be written to by a future code path. |
 
 ## Reliability, demonstrated
 
-Every claim above was verified by *running* the failure, not by reasoning about it.
+I tested each of these by actually causing the failure, instead of reasoning that it should work.
 
 - **A worker `kill -9`'d mid-delivery loses nothing.** Three real worker processes, nine events
   against a deliberately slow endpoint so the work actually overlapped — mid-flight state
-  `queue=6 processing=3 inflight=3`, split 3/3/3 across disjoint sets. One worker was killed with
-  `SIGKILL` while holding a job; the job and its pickup timestamp survived, the survivors kept
-  delivering without a gap, and ~60s later a sibling reclaimed and completed the orphan.
-  **`RECLAIMED` appears exactly once across all three logs** — two workers swept the same job
-  every 10 seconds for a minute and only one claimed it, which is what the Lua script guarantees.
-- **A subscriber that accepts the connection and never answers is cut off at 10 seconds** —
-  measured at 10,011 ms — instead of pinning a worker indefinitely.
-- **The signature is verified by a second implementation.** A ~100-line Python subscriber written
-  from the published spec, importing none of the Java, computes a **byte-identical** signature. On
-  the retry path the same event produces three distinct timestamps and three distinct signatures
-  but one event id — the pair that must disagree, disagreeing.
-- **The SSRF guard was disabled on purpose to prove it is what blocks.** With the check removed,
-  `http://169.254.169.254/latest/meta-data/` returned `202` and landed on the queue as a real job
-  with a retry budget. Restored, the same URL returns `400` **and the queue length does not
-  move** — the status code isn't the proof; the absent side effect is.
-- **Payloads never appear in application logs or in the delivery-attempt table**, asserted by
-  counting a unique marker in both, with a line-count sanity check so a zero can't come from an
-  empty file.
+  `queue=6 processing=3 inflight=3`. I killed one worker with `SIGKILL` while it held a job; the
+  job and its pickup timestamp survived, the other two kept delivering, and ~60s later a sibling
+  reclaimed and finished the orphan. `RECLAIMED` appears exactly once across all three logs, even
+  though two workers swept the same job every 10 seconds for a minute — that's what the Lua
+  script guarantees.
+- **The signature is verified by a second implementation.** I wrote a ~100-line Python subscriber
+  from the published spec, importing none of the Java, and it computes a byte-identical signature.
+  On the retry path the same event gives three different timestamps and three different signatures
+  but one event id, which is exactly what should happen.
+- **I disabled the SSRF guard on purpose to prove it's what blocks.** With the check removed,
+  `http://169.254.169.254/latest/meta-data/` returned `202` and landed on the queue as a real job.
+  Restored, the same URL returns `400` **and the queue length does not move** — the `400` on its
+  own doesn't prove much; the queue not moving does.
 
 ### And again on EKS, under load
 
-The local failure tests above were repeated on a real cluster with the load generator running:
+I repeated the failure tests on the real cluster with the load generator running:
 
 - **A worker killed with `--grace-period=0` while holding three in-flight jobs lost nothing.**
   `webhook_processing_depth` read **3 at the instant of the kill**. A *surviving* worker's log
   then shows `RECLAIMED event 08c7f640-… — no worker completed it within 60s, re-queued`, and
-  that event has **exactly one row** in PostgreSQL. No loss, and no duplicate.
+  that event has **exactly one row** in PostgreSQL. No loss, no duplicate.
 - **Over a full chaos run: 10,800 events accepted → 10,800 delivery attempts → 0 dead-lettered.**
-- 🔴 **The recovery claim is deliberately split in two, because only half of it is this system's
-  doing.** "The pool returned to 3/3 in 34 s" is a statement about Kubernetes — any Deployment
-  replaces a missing pod. **"No event was lost" is the reliable-queue implementation**: a job the
-  dead worker had already taken off the queue is invisible to Kubernetes, and nothing about
-  replacing a pod puts it back.
-- **The SSRF guard was re-verified against the cloud it now runs in.** From the public endpoint,
-  a subscriber URL of `169.254.169.254` — the AWS instance-metadata address — returns `400`, as
-  do the cluster's own DNS names and ClusterIPs, while a public URL still returns `202`.
+- **I split the recovery claim in two, because only half of it is my code's doing.** "The pool
+  returned to 3/3 in 34 s" is a statement about Kubernetes — any Deployment replaces a missing
+  pod. "No event was lost" is the reliable queue: a job the dead worker had already taken off the
+  queue is invisible to Kubernetes, and replacing a pod does nothing to put it back.
 
 ## Security
 
@@ -248,7 +224,7 @@ The local failure tests above were repeated on a real cluster with the load gene
   `${ENV_VAR}` placeholders with **no defaults**, so a missing secret fails startup rather than
   silently running unauthenticated.
 
-**Known gaps, named deliberately** — security work is only credible if the holes are stated too:
+**Known gaps** — I'd rather name these than have someone find them:
 
 - **DNS rebinding is undefended.** The URL is checked at ingest and re-resolved by the worker at
   delivery time; only the first moment is guarded. Pinning the validated IP is the fix.
@@ -274,9 +250,8 @@ curl localhost:8080/actuator/health
 # {"status":"UP","groups":["liveness","readiness"]}
 ```
 
-Those two groups aren't decoration — `/actuator/health/liveness` and `/actuator/health/readiness`
-are the exact endpoints Kubernetes probes call to decide whether to restart a pod or stop routing
-traffic to it.
+Those two groups matter: `/actuator/health/liveness` and `/actuator/health/readiness` are the
+endpoints Kubernetes probes call to decide whether to restart a pod or stop sending it traffic.
 
 ### Sending an event
 
@@ -294,29 +269,10 @@ curl -X POST localhost:8080/events \
 The `202` is deliberate: the event has been *queued*, not delivered. Returning `200` would claim
 it reached the subscriber, and a caller who believes that will never retry.
 
-> ⚠️ **A test subscriber on `localhost` will be refused with a `400`, and that's correct.**
-> `localhost` is `127.0.0.1`, and the SSRF check cannot distinguish a harmless test server from an
-> attacker's internal target — there is no difference visible from the address. Use a public
-> endpoint when trying this out. A dev-profile allowlist would solve it and is deliberately not
-> implemented: a bypass switch is exactly the thing that reaches production still enabled.
-
-### The delivery log
-
-```sql
-SELECT event_id, attempt_number, status_code, success, duration_ms FROM delivery_attempts;
-```
-
-```
-              event_id              | attempt_number | status_code | success | duration_ms
-------------------------------------+----------------+-------------+---------+-------------
- 3f2504e0-4f89-11d3-9a0c-0305e82c33 |              1 |         200 | t       |          87
- 1111000a-0000-0000-0000-0000000001 |              1 |             | f       |       10024
-```
-
-**`status_code` is nullable on purpose.** The second row is a timeout — no response ever arrived,
-so there is no status code. Writing `500` there would claim the subscriber reported a failure,
-when it may have succeeded and simply answered too late. Different problems, different owners, and
-only `NULL` says which happened.
+> **A test subscriber on `localhost` gets refused with a `400`, and that's correct.** `localhost`
+> is `127.0.0.1`, and the SSRF check can't tell a harmless test server from an attacker's internal
+> target — they look identical from the address. Use a public endpoint to try this out. I didn't
+> add a dev-profile allowlist because a bypass switch is exactly the thing that ships still on.
 
 ## Tech stack
 
@@ -332,33 +288,34 @@ IRSA · Micrometer · Prometheus · Grafana
 created with `eksctl`; infrastructure-as-code was out of scope) · service mesh · CI/CD to the
 cluster · AWS Secrets Manager (Kubernetes Secrets are used instead — see *Honest limitations*)
 
-## Roadmap
-
-| Phase | Scope | Status |
-|---|---|---|
-| Foundations | System design, data model, failure modes, security architecture | ✅ Complete |
-| Core pipeline | `POST /events` → Redis → worker → HTTP delivery → PostgreSQL log | ✅ Complete |
-| Resilience & security | Retry with jitter · DLQ · multi-worker recovery sweep · HMAC signing · SSRF validation | ✅ Complete |
-| Test suite | JUnit 5 + Mockito across all three modules, JaCoCo-tracked | ✅ Complete |
-| Containerization | Multi-stage distroless images · Kubernetes manifests · local cluster deploy | ✅ Complete |
-| Cloud deployment | AWS EKS · ElastiCache + RDS in private subnets · ALB Ingress · HTTPS · IRSA | ✅ Complete |
-| Observability | Prometheus + Grafana dashboards · load testing · documented chaos test | ✅ Complete |
-
 ## Honest limitations
 
-Things a reviewer would find, listed here rather than left to be discovered:
+Stuff I know is wrong with it, so you don't have to go looking:
 
 - **The application pods do not use IRSA.** Only the AWS Load Balancer Controller does. The app
   reads its credentials from Kubernetes Secrets. AWS Secrets Manager was scoped out.
-- **There is no alerting.** Alertmanager is deliberately disabled — the stack is dashboards-only.
-  A dashboard shows you; an alert tells you. Nothing here would wake anyone up.
+- **There is no alerting.** I never set up Alertmanager, so this is dashboards only. Nothing here
+  would page anyone.
 - **Delivery latency cannot be broken down per subscriber.** The `uri` and `client.name` labels
   are collapsed to a constant, because subscriber URLs are unbounded and each unique pair cost a
   measured 54 Prometheus series per pod. Per-subscriber timing lives in the PostgreSQL log
-  instead, where a row is cheap in the way a time series is not.
+  instead, where an extra row costs a lot less than an extra time series.
 - **The control plane is not observable.** On EKS, `etcd`, the scheduler and the controller
   manager run in AWS's account — you get an SLA instead of a dashboard.
 - **No infrastructure-as-code.** The cluster is reproducible from `deploy/cluster.yaml`, but the
   ALB, its target groups and its security groups are created by a controller and exist in no file.
 - **The load test's subscriber is an nginx behind an ALB**, not a third-party endpoint. Measuring
   against `httpbin.org` gave a p95 of 373 ms, almost all of it someone else's server.
+
+## What I'd do differently
+
+- **Let the load balancer controller find its own VPC instead of hardcoding it.** That line broke
+  the first time I rebuilt the cluster — and the two values my checklist actually warned me about
+  regenerated identically.
+- **Write a script that checks every AWS id I've recorded still matches what's live.** A stale
+  value that happens to still be right looks exactly like a verified one.
+- **Pin the IP after validating it**, so the worker connects to the address that was actually
+  checked. Right now the URL is checked at ingest and re-resolved at delivery, which is what
+  leaves DNS rebinding open.
+- **Deduplicate on the producer side** with a `SETNX` on the event id, instead of putting the
+  whole burden on whoever receives the webhook.
